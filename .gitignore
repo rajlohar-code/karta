@@ -46,3 +46,10 @@ desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Local Planning & Contract Documents
+SRS — Collaborative AI Workspace v1.1.md
+karta_design_system.md
+project_structure_lld.md
+AGENTS.md
+
