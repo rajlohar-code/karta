@@ -38,6 +38,7 @@ class TableDef(BaseModel):
     name: str = Field(min_length=1, max_length=64, description="Table name (e.g. 'users', 'orders')")
     columns: list[ColumnDef] = Field(default_factory=list, description="Ordered list of column definitions")
     description: str | None = Field(default=None, max_length=256, description="Optional developer notes")
+    sample_data: list[dict[str, Any]] = Field(default_factory=list, description="Sample / mock rows for table inspection and prototyping")
 
 
 class ForeignKeyDef(BaseModel):
