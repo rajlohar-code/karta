@@ -17,6 +17,11 @@ htmlcov/
 .coverage
 .coverage.*
 
+# Application Logs
+logs/
+*.log
+
+
 # Node.js & Frontend Builds
 node_modules/
 dist/
