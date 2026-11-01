@@ -22,6 +22,10 @@ from app.infra.database import Base, engine
 # When adding new models in the future, import them here.
 from app.domains.users.models import User
 from app.domains.workspaces.models import Workspace, WorkspaceMember
+from app.domains.projects.models import Project
+from app.domains.diagrams.models import Diagram, DiagramRevision
+
+
 
 
 
