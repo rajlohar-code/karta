@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.services.log_service import log_endpoint
+from app.domains.users.router import router as auth_router
 
 
 def create_application() -> FastAPI:
@@ -76,6 +77,12 @@ def create_application() -> FastAPI:
             "status": "ok",
             "app": settings.PROJECT_NAME,
         }
+
+    # -------------------------------------------------------------------------
+    # Domain Routers Mounting
+    # -------------------------------------------------------------------------
+    # Mount the Authentication router (/api/v1/auth)
+    app.include_router(auth_router)
 
     return app
 
