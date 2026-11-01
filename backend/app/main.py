@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.services.log_service import log_endpoint
 from app.domains.users.router import router as auth_router
+from app.domains.workspaces.router import router as workspaces_router
 
 
 def create_application() -> FastAPI:
@@ -83,6 +84,9 @@ def create_application() -> FastAPI:
     # -------------------------------------------------------------------------
     # Mount the Authentication router (/api/v1/auth)
     app.include_router(auth_router)
+
+    # Mount the Workspaces router (/api/v1/workspaces)
+    app.include_router(workspaces_router)
 
     return app
 
