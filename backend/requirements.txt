@@ -19,3 +19,6 @@ alembic>=1.14.0
 itsdangerous>=2.2.0
 email-validator>=2.3.0
 
+# Testing Suite (Unit, Integration & Async Test Runner)
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
