@@ -4,6 +4,7 @@ from app.config import settings
 from app.services.log_service import log_endpoint
 from app.domains.users.router import router as auth_router
 from app.domains.workspaces.router import router as workspaces_router
+from app.domains.projects.router import router as projects_router
 
 
 def create_application() -> FastAPI:
@@ -87,6 +88,9 @@ def create_application() -> FastAPI:
 
     # Mount the Workspaces router (/api/v1/workspaces)
     app.include_router(workspaces_router)
+
+    # Mount the Projects router (/api/v1/workspaces/{slug}/projects)
+    app.include_router(projects_router)
 
     return app
 
