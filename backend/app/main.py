@@ -5,6 +5,7 @@ from app.services.log_service import log_endpoint
 from app.domains.users.router import router as auth_router
 from app.domains.workspaces.router import router as workspaces_router
 from app.domains.projects.router import router as projects_router
+from app.domains.diagrams.router import diagrams_router, project_diagrams_router
 
 
 def create_application() -> FastAPI:
@@ -91,6 +92,10 @@ def create_application() -> FastAPI:
 
     # Mount the Projects router (/api/v1/workspaces/{slug}/projects)
     app.include_router(projects_router)
+
+    # Mount the Diagrams routers (/api/v1/projects/{project_id}/diagrams & /api/v1/diagrams)
+    app.include_router(project_diagrams_router)
+    app.include_router(diagrams_router)
 
     return app
 
