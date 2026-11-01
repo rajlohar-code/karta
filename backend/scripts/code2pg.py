@@ -21,6 +21,8 @@ from app.infra.database import Base, engine
 # Import all domain models so SQLAlchemy Base knows about all tables!
 # When adding new models in the future, import them here.
 from app.domains.users.models import User
+from app.domains.workspaces.models import Workspace, WorkspaceMember
+
 
 
 async def sync_code_to_postgres():
