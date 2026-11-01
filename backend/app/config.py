@@ -14,6 +14,10 @@ class Settings(BaseSettings):
     # Secret key for signing HTTP-only session cookies
     SECRET_KEY: str = "karta_insecure_dev_secret_change_in_production"
 
+    # Email & Client Frontend URLs (Configurable via .env or Admin Settings)
+    EMAIL_FROM: str = "Karta Team <noreply@karta.app>"
+    FRONTEND_URL: str = "http://localhost:5173"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

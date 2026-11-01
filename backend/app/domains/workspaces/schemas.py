@@ -121,3 +121,51 @@ class AddMemberRequest(BaseModel):
         pattern="^(owner|editor|viewer)$",
         description="Role: 'owner', 'editor', or 'viewer'"
     )
+
+
+# -----------------------------------------------------------------------------
+# 5. Token-based Production Invitation Schemas
+# -----------------------------------------------------------------------------
+class CreateInvitationRequest(BaseModel):
+    """
+    Request payload to send an email invitation with an unguessable token link.
+    
+    POST /api/v1/workspaces/{slug}/invitations
+    Payload:
+      {
+        "email": "future.teammate@company.com",
+        "role": "editor"
+      }
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    email: EmailStr = Field(description="Email of person to invite")
+    role: str = Field(
+        default="editor",
+        pattern="^(editor|viewer)$",
+        description="Role to grant: 'editor' or 'viewer'"
+    )
+
+
+class WorkspaceInvitationResponse(BaseModel):
+    """Details of an issued or pending workspace invitation."""
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+    id: int = Field(description="Unique invitation ID")
+    workspace_id: int = Field(description="Target workspace ID")
+    email: EmailStr = Field(description="Invited user email")
+    role: str = Field(description="Role: 'editor' or 'viewer'")
+    status: str = Field(description="Status: 'pending', 'accepted', 'revoked', 'expired'")
+    expires_at: datetime = Field(description="Expiration timestamp in UTC")
+    created_at: datetime = Field(description="Issued timestamp in UTC")
+    invite_link: str = Field(description="Complete acceptance URL link")
+
+
+class AcceptInvitationResponse(BaseModel):
+    """Response returned when an invite token is accepted."""
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(default="Invitation accepted successfully", description="Status message")
+    workspace_slug: str = Field(description="Slug of the workspace joined")
+    workspace_name: str = Field(description="Name of the workspace joined")
+    role: str = Field(description="Assigned role in workspace")

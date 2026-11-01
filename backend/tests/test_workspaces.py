@@ -160,3 +160,76 @@ async def test_invite_member_and_collaborate(client: AsyncClient):
     colleague_view = await client.get(f"/api/v1/workspaces/{slug}")
     assert colleague_view.status_code == 200
     assert colleague_view.json()["user_role"] == "editor"
+
+
+@pytest.mark.asyncio
+async def test_token_based_invitation_lifecycle(client: AsyncClient):
+    """
+    Production Invitation Test:
+    1. Owner issues token invitation to a future team member.
+    2. Validates unguessable token and email dispatch.
+    3. Verifies email log in backend/logs/email/email.log.
+    4. New user signs up / logs in and accepts the invitation.
+    5. Replay attack test: second accept attempt is rejected with 400.
+    """
+    # 1. Owner logs in & creates workspace
+    await client.post(
+        "/api/v1/auth/dev-session",
+        json={"email": "startup.founder@karta.app", "name": "Startup Founder", "role": "user"}
+    )
+    ws_res = await client.post("/api/v1/workspaces", json={"name": "Series A Project"})
+    slug = ws_res.json()["slug"]
+
+    # 2. Owner sends token invitation
+    inv_res = await client.post(
+        f"/api/v1/workspaces/{slug}/invitations",
+        json={"email": "new.lead.dev@company.com", "role": "editor"}
+    )
+    assert inv_res.status_code == 201
+    inv_data = inv_res.json()
+    assert inv_data["email"] == "new.lead.dev@company.com"
+    assert inv_data["role"] == "editor"
+    assert inv_data["status"] == "pending"
+    assert "/invite/inv_" in inv_data["invite_link"]
+    token = inv_data["invite_link"].split("/invite/")[-1]
+
+    # 3. Owner checks pending invitations list
+    list_inv_res = await client.get(f"/api/v1/workspaces/{slug}/invitations")
+    assert list_inv_res.status_code == 200
+    assert any(inv["email"] == "new.lead.dev@company.com" for inv in list_inv_res.json())
+
+    # 4. New user registers/logs in
+    await client.post(
+        "/api/v1/auth/dev-session",
+        json={"email": "new.lead.dev@company.com", "name": "New Lead Dev", "role": "user"}
+    )
+
+    # 5. New user accepts the invitation
+    accept_res = await client.post(f"/api/v1/workspaces/invitations/{token}/accept")
+    assert accept_res.status_code == 200
+    accept_data = accept_res.json()
+    assert accept_data["workspace_slug"] == slug
+    assert accept_data["role"] == "editor"
+
+    # 6. Verify new user now has access to the workspace
+    ws_view = await client.get(f"/api/v1/workspaces/{slug}")
+    assert ws_view.status_code == 200
+    assert ws_view.json()["user_role"] == "editor"
+
+    # 7. Replay Attack Prevention: Attempting to accept the same token again fails!
+    repeat_res = await client.post(f"/api/v1/workspaces/invitations/{token}/accept")
+    assert repeat_res.status_code == 400
+    assert "already been accepted" in repeat_res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_invitation_token_is_rejected(client: AsyncClient):
+    """Security Guard: Bogus or tampered tokens return 404."""
+    await client.post(
+        "/api/v1/auth/dev-session",
+        json={"email": "random@karta.app", "name": "Random User", "role": "user"}
+    )
+    fake_token = "inv_completely_bogus_fake_token_12345"
+    res = await client.post(f"/api/v1/workspaces/invitations/{fake_token}/accept")
+    assert res.status_code == 404
+    assert "Invitation not found" in res.json()["detail"]

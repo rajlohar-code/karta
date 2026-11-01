@@ -8,25 +8,31 @@ Adheres to:
 - Mandatory @log_endpoint decorator on every single route
 - Full docstrings with request and response JSON examples
 """
+from datetime import datetime, timedelta, timezone
 import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.config import settings
 from app.core.capabilities import Capability
 from app.core.permissions import PermissionChecker
 from app.dependencies import get_current_user
 from app.domains.users.models import User
-from app.domains.workspaces.models import Workspace, WorkspaceMember
+from app.domains.workspaces.models import Workspace, WorkspaceInvitation, WorkspaceMember
 from app.domains.workspaces.schemas import (
+    AcceptInvitationResponse,
     AddMemberRequest,
+    CreateInvitationRequest,
     WorkspaceCreate,
+    WorkspaceInvitationResponse,
     WorkspaceMemberResponse,
     WorkspaceResponse,
     WorkspaceUpdate,
 )
 from app.infra.database import get_db
+from app.services.email_service import EmailProvider, get_email_service
 from app.services.log_service import log_endpoint
 
 # Create router with RESTful prefix and OpenAPI tag
@@ -40,6 +46,15 @@ def _generate_workspace_slug() -> str:
     """
     raw_token = secrets.token_urlsafe(6).replace("-", "").replace("_", "")
     return f"w_{raw_token[:8]}"
+
+
+def _generate_invitation_token() -> str:
+    """
+    Generate a cryptographically secure, unguessable URL token for invitations.
+    Example output: 'inv_8xK9mP2qR4tY7zL1w3'
+    """
+    token_str = secrets.token_urlsafe(24).replace("-", "").replace("_", "")
+    return f"inv_{token_str[:32]}"
 
 
 # -----------------------------------------------------------------------------
@@ -523,4 +538,279 @@ async def add_workspace_member(
         avatar_url=target_user.avatar_url,
         role=new_member.role,
         joined_at=new_member.joined_at,
+    )
+
+
+# -----------------------------------------------------------------------------
+# 7. Create & Send Email Invitation (Production Token Flow)
+# -----------------------------------------------------------------------------
+@router.post(
+    "/{slug}/invitations",
+    response_model=WorkspaceInvitationResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Send an email invitation with an unguessable token link",
+)
+@log_endpoint(folder_name="workspaces", file_name="workspaces.log")
+async def create_workspace_invitation(
+    slug: str,
+    payload: CreateInvitationRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    email_service: EmailProvider = Depends(get_email_service),
+):
+    """
+    Issue an unguessable, 7-day token-based invitation and send an email to the recipient.
+    
+    ---------------------------------------------------------------------------
+    SECURITY ARCHITECTURE:
+    - Capability: Requires Capability.INVITE_MEMBERS (Owner permission).
+    - Prevents duplicate invitations: Re-uses/refreshes any existing pending invitation.
+    - Unguessable token: 32 cryptographically random URL-safe characters.
+    - Expiration window: 7 days strictly enforced.
+    - Pluggable Email: Dispatches notification via EmailProvider.
+    ---------------------------------------------------------------------------
+    """
+    # 1. Fetch workspace
+    ws_res = await db.execute(select(Workspace).where(Workspace.slug == slug))
+    workspace = ws_res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    # 2. Check current user's role and capability
+    curr_mem = await db.execute(
+        select(WorkspaceMember.role).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    current_role = curr_mem.scalar_one_or_none()
+    if not PermissionChecker.is_permitted(current_role, Capability.INVITE_MEMBERS):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: Only workspace owners can invite new members"
+        )
+
+    # 3. Check if recipient is already an active member of this workspace
+    user_check = await db.execute(select(User).where(User.email == payload.email))
+    existing_user = user_check.scalar_one_or_none()
+    if existing_user:
+        active_mem = await db.execute(
+            select(WorkspaceMember).where(
+                WorkspaceMember.workspace_id == workspace.id,
+                WorkspaceMember.user_id == existing_user.id
+            )
+        )
+        if active_mem.scalar_one_or_none():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"User with email '{payload.email}' is already an active member of this workspace"
+            )
+
+    # 4. Generate unguessable token and 7-day expiration
+    token = _generate_invitation_token()
+    now_utc = datetime.now(timezone.utc)
+    expires_at = now_utc + timedelta(days=7)
+
+    # 5. Check if there's an existing pending invite for this email; if so, revoke it
+    existing_inv_res = await db.execute(
+        select(WorkspaceInvitation).where(
+            WorkspaceInvitation.workspace_id == workspace.id,
+            WorkspaceInvitation.email == payload.email,
+            WorkspaceInvitation.status == "pending"
+        )
+    )
+    existing_inv = existing_inv_res.scalar_one_or_none()
+    if existing_inv:
+        existing_inv.status = "revoked"
+
+    # 6. Insert new WorkspaceInvitation
+    invitation = WorkspaceInvitation(
+        workspace_id=workspace.id,
+        email=payload.email,
+        role=payload.role,
+        token=token,
+        invited_by_id=current_user.id,
+        status="pending",
+        expires_at=expires_at,
+    )
+    db.add(invitation)
+    await db.commit()
+    await db.refresh(invitation)
+
+    # 7. Dispatch Email through pluggable EmailService
+    await email_service.send_invitation_email(
+        recipient_email=payload.email,
+        workspace_name=workspace.name,
+        inviter_name=current_user.name,
+        role=payload.role,
+        invite_token=token,
+    )
+
+    invite_url = f"{settings.FRONTEND_URL}/invite/{token}"
+    return WorkspaceInvitationResponse(
+        id=invitation.id,
+        workspace_id=invitation.workspace_id,
+        email=invitation.email,
+        role=invitation.role,
+        status=invitation.status,
+        expires_at=invitation.expires_at,
+        created_at=invitation.created_at,
+        invite_link=invite_url,
+    )
+
+
+# -----------------------------------------------------------------------------
+# 8. List Pending Invitations (Owner Only)
+# -----------------------------------------------------------------------------
+@router.get(
+    "/{slug}/invitations",
+    response_model=list[WorkspaceInvitationResponse],
+    status_code=status.HTTP_200_OK,
+    summary="List all pending invitations for a workspace",
+)
+@log_endpoint(folder_name="workspaces", file_name="workspaces.log")
+async def list_pending_invitations(
+    slug: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List pending invitations awaiting acceptance."""
+    # 1. Fetch workspace
+    ws_res = await db.execute(select(Workspace).where(Workspace.slug == slug))
+    workspace = ws_res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    # 2. Check owner permission
+    curr_mem = await db.execute(
+        select(WorkspaceMember.role).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    current_role = curr_mem.scalar_one_or_none()
+    if not PermissionChecker.is_permitted(current_role, Capability.INVITE_MEMBERS):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    # 3. Query pending invitations
+    invs_res = await db.execute(
+        select(WorkspaceInvitation)
+        .where(
+            WorkspaceInvitation.workspace_id == workspace.id,
+            WorkspaceInvitation.status == "pending"
+        )
+        .order_by(WorkspaceInvitation.created_at.desc())
+    )
+    invitations = invs_res.scalars().all()
+
+    return [
+        WorkspaceInvitationResponse(
+            id=inv.id,
+            workspace_id=inv.workspace_id,
+            email=inv.email,
+            role=inv.role,
+            status=inv.status,
+            expires_at=inv.expires_at,
+            created_at=inv.created_at,
+            invite_link=f"{settings.FRONTEND_URL}/invite/{inv.token}",
+        )
+        for inv in invitations
+    ]
+
+
+# -----------------------------------------------------------------------------
+# 9. Accept Workspace Invitation by Token
+# -----------------------------------------------------------------------------
+@router.post(
+    "/invitations/{token}/accept",
+    response_model=AcceptInvitationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Accept an invitation token and join the workspace",
+)
+@log_endpoint(folder_name="workspaces", file_name="workspaces.log")
+async def accept_workspace_invitation(
+    token: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Accept an invitation token and add the authenticated user to the workspace.
+    
+    ---------------------------------------------------------------------------
+    SECURITY CHECKS:
+    1. Validates token existence and authenticity.
+    2. Validates invitation is in 'pending' status.
+    3. Validates expiration: rejects expired tokens (> 7 days).
+    4. Automatically adds membership with the exact invited role ('editor'/'viewer').
+    5. Marks invitation status as 'accepted' to prevent replay attacks.
+    ---------------------------------------------------------------------------
+    """
+    # 1. Fetch invitation by token
+    inv_res = await db.execute(select(WorkspaceInvitation).where(WorkspaceInvitation.token == token))
+    invitation = inv_res.scalar_one_or_none()
+
+    if not invitation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Invitation not found or invalid token"
+        )
+
+    # 2. Check status
+    if invitation.status == "accepted":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invitation has already been accepted"
+        )
+    if invitation.status == "revoked":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invitation has been revoked by the workspace owner"
+        )
+
+    # 3. Check expiration
+    now_utc = datetime.now(timezone.utc)
+    if now_utc > invitation.expires_at:
+        invitation.status = "expired"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This invitation has expired. Please ask the owner for a new invitation."
+        )
+
+    # 4. Fetch the target workspace
+    ws_res = await db.execute(select(Workspace).where(Workspace.id == invitation.workspace_id))
+    workspace = ws_res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace no longer exists")
+
+    # 5. Check if already a member
+    mem_check = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    existing_mem = mem_check.scalar_one_or_none()
+
+    if not existing_mem:
+        # Add to workspace members
+        new_membership = WorkspaceMember(
+            workspace_id=workspace.id,
+            user_id=current_user.id,
+            role=invitation.role,
+        )
+        db.add(new_membership)
+
+    # 6. Mark invitation accepted
+    invitation.status = "accepted"
+    await db.commit()
+
+    return AcceptInvitationResponse(
+        message="Invitation accepted successfully",
+        workspace_slug=workspace.slug,
+        workspace_name=workspace.name,
+        role=invitation.role,
     )

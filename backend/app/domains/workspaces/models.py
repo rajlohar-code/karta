@@ -146,3 +146,98 @@ class WorkspaceMember(Base):
 
     def __repr__(self) -> str:
         return f"<WorkspaceMember workspace_id={self.workspace_id} user_id={self.user_id} role='{self.role}'>"
+
+
+class WorkspaceInvitation(Base):
+    """
+    SQLAlchemy ORM Model representing an unguessable token-based Workspace Invitation.
+    
+    ---------------------------------------------------------------------------
+    PRODUCTION INVITATION SYSTEM:
+    When an owner invites a collaborator via email:
+    1. A cryptographically unguessable token (e.g. 'inv_7xK9mP2q...') is generated.
+    2. An expiration window is set (default: 7 days).
+    3. Status is tracked: 'pending' -> 'accepted' | 'revoked' | 'expired'.
+    4. An email notification is sent with the clickable acceptance link.
+    5. Works seamlessly whether the invitee already has an account or signs up later!
+    ---------------------------------------------------------------------------
+    """
+    __tablename__ = "workspace_invitations"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        doc="Internal invitation record ID",
+    )
+
+    workspace_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="Target workspace ID",
+    )
+
+    email: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        index=True,
+        doc="Email address of the invited collaborator",
+    )
+
+    role: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="editor",
+        doc="Assigned role: 'editor' or 'viewer'",
+    )
+
+    token: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+        nullable=False,
+        doc="Cryptographic unguessable URL token for accepting the invite",
+    )
+
+    invited_by_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        doc="User ID of the member who sent this invitation",
+    )
+
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        doc="Invitation status: 'pending', 'accepted', 'revoked', 'expired'",
+    )
+
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        doc="Timestamp when this invitation expires (UTC)",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Timestamp when invitation was issued",
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+        doc="Timestamp when status was last updated",
+    )
+
+    # Relationships
+    workspace: Mapped["Workspace"] = relationship("Workspace")
+
+    def __repr__(self) -> str:
+        return f"<WorkspaceInvitation email='{self.email}' role='{self.role}' status='{self.status}'>"
