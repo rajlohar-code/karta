@@ -1,6 +1,10 @@
+import secrets
+from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.responses import RedirectResponse
 
 from app.config import settings
 from app.core.session import (
@@ -11,6 +15,7 @@ from app.core.session import (
 from app.dependencies import get_current_user
 from app.domains.users.models import User
 from app.domains.users.schemas import DevLoginRequest, UserResponse
+from app.domains.workspaces.models import Workspace, WorkspaceMember
 from app.infra.database import get_db
 from app.services.log_service import log_endpoint
 
@@ -194,3 +199,147 @@ async def logout(
         samesite="lax",
     )
     return {"status": "ok", "message": "Logged out successfully"}
+
+
+# -----------------------------------------------------------------------------
+# Google OAuth 2.0 Integration
+# -----------------------------------------------------------------------------
+@router.get(
+    "/google/login",
+    status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+    summary="Redirect user to Google OAuth consent page",
+)
+@log_endpoint(folder_name="auth", file_name="auth.log")
+async def google_login(request: Request):
+    """
+    Redirect the user to Google's OAuth 2.0 consent screen.
+    """
+    if not settings.GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Google OAuth is not configured on the server.",
+        )
+
+    params = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "access_type": "offline",
+        "prompt": "select_account",
+    }
+    google_auth_url = f"https://accounts.google.com/o/oauth2/v2/auth?{urlencode(params)}"
+    return RedirectResponse(url=google_auth_url)
+
+
+@router.get(
+    "/google/callback",
+    summary="Google OAuth 2.0 callback endpoint",
+)
+@log_endpoint(folder_name="auth", file_name="auth.log")
+async def google_callback(
+    request: Request,
+    code: str | None = None,
+    error: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Handle Google OAuth 2.0 redirect callback.
+    Exchanges code for tokens, fetches user profile, creates/updates user,
+    issues signed session cookie, and redirects user to frontend.
+    """
+    if error or not code:
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/?error=google_auth_cancelled")
+
+    # 1. Exchange authorization code for tokens
+    token_url = "https://oauth2.googleapis.com/token"
+    token_data = {
+        "code": code,
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }
+
+    async with httpx.AsyncClient() as client:
+        token_resp = await client.post(token_url, data=token_data)
+        if token_resp.status_code != 200:
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}/?error=token_exchange_failed")
+        tokens = token_resp.json()
+        access_token = tokens.get("access_token")
+
+        # 2. Fetch user profile from Google UserInfo endpoint
+        userinfo_resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if userinfo_resp.status_code != 200:
+            return RedirectResponse(url=f"{settings.FRONTEND_URL}/?error=userinfo_fetch_failed")
+        user_info = userinfo_resp.json()
+
+    email = user_info.get("email")
+    name = user_info.get("name") or email.split("@")[0]
+    avatar_url = user_info.get("picture")
+
+    if not email:
+        return RedirectResponse(url=f"{settings.FRONTEND_URL}/?error=no_email_provided")
+
+    # 3. Lookup user in database
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+
+    # Determine role: check if email is in ADMIN_EMAILS
+    is_admin = settings.is_admin_email(email)
+
+    if not user:
+        # Create new user
+        user = User(
+            email=email,
+            name=name,
+            avatar_url=avatar_url,
+            role="admin" if is_admin else "user",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+
+        # Automatically create default Personal Workspace for new user
+        raw_slug = secrets.token_urlsafe(6).replace("-", "").replace("_", "")[:8]
+        workspace = Workspace(
+            name=f"{name.split()[0]}'s Workspace",
+            slug=f"w_{raw_slug}",
+            owner_id=user.id,
+        )
+        db.add(workspace)
+        await db.flush()
+
+        member = WorkspaceMember(
+            workspace_id=workspace.id,
+            user_id=user.id,
+            role="owner",
+        )
+        db.add(member)
+        await db.commit()
+    else:
+        # Update existing user profile & elevate to admin if listed in ADMIN_EMAILS
+        user.name = name
+        user.avatar_url = avatar_url
+        if is_admin and user.role != "admin":
+            user.role = "admin"
+        await db.commit()
+
+    # 4. Issue signed session cookie and redirect to frontend
+    session_cookie = sign_session_data({"user_id": user.id})
+    redirect_target = f"{settings.FRONTEND_URL}/"
+
+    response = RedirectResponse(url=redirect_target, status_code=status.HTTP_302_FOUND)
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_cookie,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=not settings.DEBUG,  # True in production (HTTPS required), False in local development
+        path="/",
+    )
+    return response

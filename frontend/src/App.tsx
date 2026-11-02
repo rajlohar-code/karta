@@ -1,93 +1,172 @@
-import { useState } from 'react'
+import { useState, useEffect, useCallback } from 'react'
+import Navbar from './components/landing/Navbar'
+import type { AuthUser } from './types/auth'
+import Hero from './components/landing/Hero'
+import DualToolsSection from './components/landing/DualToolsSection'
+import TemplatesSection from './components/landing/TemplatesSection'
+import PricingSection from './components/landing/PricingSection'
+import LoginModal from './components/auth/LoginModal'
+import { API_BASE_URL } from './config/env'
+import SchemaCanvas from './features/canvas/components/SchemaCanvas'
+import Logo from './components/brand/Logo'
 
 /**
  * App Component — Root view of the Karta Frontend
- * Grounded in: karta_design_system.md
+ * Grounded in: karta_design_system.md and SRS v1.1
  *
- * This component showcases:
- * 1. Karta Brand Identity (Forest green #16a34a, rounded 8px tokens)
- * 2. React state hook (useState) to demonstrate interactive click handling
- * 3. Tailwind utility classes mapped to our custom design system
+ * ARCHITECTURE UPDATE:
+ * Following user direction, there is no standalone intermediate dashboard.
+ * Logged-in users enter directly into the Visual Canvas with the persistent
+ * ChatGPT-style left sidebar dock.
  */
 export default function App() {
-  // Local state to track interactive button clicks
-  // count: current number of clicks
-  // setCount: function to update count and trigger re-render
-  const [clickCount, setClickCount] = useState<number>(0)
+  const [currentUser, setCurrentUser] = useState<AuthUser | null>(null);
+  const [isLoginModalOpen, setIsLoginModalOpen] = useState<boolean>(false);
+  const [currentView, setCurrentView] = useState<'landing' | 'canvas'>('landing');
 
+  // Check current session on mount (via signed HttpOnly cookie)
+  const refreshUserSession = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/v1/auth/me`, {
+        credentials: 'include',
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setCurrentUser(data);
+        // Logged-in user goes directly into the Canvas workspace
+        setCurrentView('canvas');
+      } else {
+        setCurrentUser(null);
+      }
+    } catch {
+      setCurrentUser(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshUserSession();
+
+    // Check if redirected from Google OAuth with an error query param
+    const params = new URLSearchParams(window.location.search);
+    const authError = params.get('error');
+    if (authError) {
+      alert(`Google Auth Notice: ${authError}`);
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
+  }, [refreshUserSession]);
+
+  const handleSignOut = async () => {
+    try {
+      await fetch(`${API_BASE_URL}/api/v1/auth/logout`, {
+        method: 'POST',
+        credentials: 'include',
+      });
+    } catch (err) {
+      console.error('Logout error:', err);
+    } finally {
+      setCurrentUser(null);
+      setCurrentView('landing');
+    }
+  };
+
+  const handleStartDesigning = () => {
+    // Open canvas directly (both for guest and logged-in user)
+    setCurrentView('canvas');
+  };
+
+  const handleWatchDemo = () => {
+    alert('Karta interactive product walkthrough');
+  };
+
+  const handleUseTemplate = (_templateId: string) => {
+    setCurrentView('canvas');
+  };
+
+  const handleSelectPlan = (planId: string, billingCycle: 'monthly' | 'yearly') => {
+    if (!currentUser) {
+      setIsLoginModalOpen(true);
+    } else {
+      alert(`Selected plan: "${planId}" (${billingCycle}). Will launch Razorpay checkout modal.`);
+    }
+  };
+
+  // 1. Direct Canvas View (with Persistent ChatGPT-Style Left Sidebar)
+  if (currentView === 'canvas') {
+    return (
+      <>
+        <SchemaCanvas
+          user={currentUser}
+          onBackToHome={() => setCurrentView('landing')}
+          onOpenAuthModal={() => setIsLoginModalOpen(true)}
+          onSignOut={handleSignOut}
+        />
+
+        {/* Global Google OAuth Login Modal */}
+        <LoginModal
+          isOpen={isLoginModalOpen}
+          onClose={() => setIsLoginModalOpen(false)}
+        />
+      </>
+    );
+  }
+
+  // 2. Landing Page View (for first-time visitors / guests before entering canvas)
   return (
-    <div className="min-h-screen bg-bg flex flex-col items-center justify-center p-6">
-      {/* ------------------------------------------------------------------- */}
-      {/* Main Hero Card Container (12px card border radius) */}
-      {/* ------------------------------------------------------------------- */}
-      <div className="bg-white border border-border rounded-card p-8 shadow-card max-w-md w-full text-center">
-        
-        {/* Brand Logo & Name */}
-        <div className="flex items-center justify-center gap-3 mb-4">
-          {/* Logo mark: 32x32 rounded square in Primary Green (#16a34a) */}
-          <div className="w-8 h-8 bg-karta-500 rounded-lg flex items-center justify-center shadow-sm">
-            {/* 4-square icon representing schema tables & flow nodes */}
-            <div className="grid grid-cols-2 gap-0.5 w-4 h-4">
-              <div className="bg-white rounded-[1px]"></div>
-              <div className="bg-white rounded-[1px]"></div>
-              <div className="bg-white rounded-[1px]"></div>
-              <div className="bg-karta-200 rounded-[1px]"></div>
-            </div>
+    <div className="min-h-screen bg-bg flex flex-col font-sans text-ink selection:bg-karta-200 selection:text-karta-900">
+      {/* Official Sticky Navbar */}
+      <Navbar
+        onSignInClick={() => setIsLoginModalOpen(true)}
+        onGetStartedClick={handleStartDesigning}
+        user={currentUser}
+        onSignOut={handleSignOut}
+      />
+
+      {/* Hero Section */}
+      <main className="flex-1">
+        <Hero
+          onStartDesigning={handleStartDesigning}
+          onWatchDemo={handleWatchDemo}
+        />
+
+        {/* Dual Tools Section (Schema & Flowchart) */}
+        <DualToolsSection />
+
+        {/* Ready-to-Use Templates Section */}
+        <TemplatesSection onUseTemplate={handleUseTemplate} />
+
+        {/* Developer Pricing Section */}
+        <PricingSection onSelectPlan={handleSelectPlan} />
+      </main>
+
+      {/* Production SaaS Footer */}
+      <footer className="border-t border-border bg-white py-10">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-6">
+          <div className="flex items-center gap-3">
+            <Logo size="sm" />
+            <span className="text-xs text-muted hidden sm:inline">
+              Visual thinking for developers
+            </span>
           </div>
 
-          {/* Wordmark */}
-          <span className="text-2xl font-semibold text-karta-700 tracking-[-0.5px]">
-            Karta
-          </span>
-        </div>
+          <div className="flex items-center gap-6 text-xs text-muted">
+            <a href="#templates" className="hover:text-ink transition-colors">Templates</a>
+            <a href="#pricing" className="hover:text-ink transition-colors">Pricing</a>
+            <span className="hover:text-ink cursor-pointer transition-colors">Privacy</span>
+            <span className="hover:text-ink cursor-pointer transition-colors">Terms</span>
+          </div>
 
-        {/* Brand Tagline */}
-        <p className="text-sm text-muted mb-6 italic">
-          Visual thinking for developers
-        </p>
-
-        {/* Phase 0 Status Badge */}
-        <div className="inline-flex items-center gap-2 bg-surface text-karta-700 border border-karta-200 text-xs px-3 py-1.5 rounded-full mb-6 font-medium">
-          <span className="w-2 h-2 rounded-full bg-karta-500 animate-pulse"></span>
-          Phase 0: Environment & Tooling Ready
-        </div>
-
-        {/* Interactive Click Counter Demonstration */}
-        <div className="mb-6 p-4 bg-bg rounded-lg border border-border">
-          <p className="text-xs text-muted mb-1">Testing React State (useState)</p>
-          <p className="text-xl font-semibold text-ink">
-            Clicks: <span className="text-karta-600">{clickCount}</span>
+          <p className="text-xs text-muted">
+            &copy; 2026 Karta. All rights reserved.
           </p>
         </div>
+      </footer>
 
-        {/* Action Buttons styled strictly per karta_design_system.md */}
-        <div className="flex flex-col gap-3">
-          {/* Primary Button */}
-          <button
-            type="button"
-            onClick={() => setClickCount(clickCount + 1)}
-            className="w-full bg-karta-500 hover:bg-karta-600 text-white font-medium text-sm py-2 px-4 rounded-lg transition-colors shadow-sm focus:outline-none focus:ring-2 focus:ring-karta-200"
-          >
-            Increment Counter
-          </button>
-
-          {/* Secondary Reset Button */}
-          {clickCount > 0 && (
-            <button
-              type="button"
-              onClick={() => setClickCount(0)}
-              className="w-full bg-surface hover:bg-karta-200 text-karta-700 border border-karta-200 font-medium text-xs py-1.5 px-3 rounded-lg transition-colors"
-            >
-              Reset to 0
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Footer Info */}
-      <p className="text-xs text-muted mt-6">
-        FastAPI Backend + React TypeScript Frontend • Clean DDD Architecture
-      </p>
+      {/* Google OAuth Authentication Modal */}
+      <LoginModal
+        isOpen={isLoginModalOpen}
+        onClose={() => setIsLoginModalOpen(false)}
+      />
     </div>
-  )
+  );
 }
+

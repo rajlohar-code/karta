@@ -107,6 +107,37 @@ async def test_update_and_delete_project(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_pin_project_floats_to_top(client: AsyncClient):
+    """Pinning Test: Pinned projects must appear at the top of the list."""
+    await client.post(
+        "/api/v1/auth/dev-session",
+        json={"email": "pinner@karta.app", "name": "Pin User", "role": "user"}
+    )
+    ws = (await client.post("/api/v1/workspaces", json={"name": "Pin Workspace"})).json()
+    slug = ws["slug"]
+
+    # Create project 1 (older, unpinned)
+    p1 = (await client.post(f"/api/v1/workspaces/{slug}/projects", json={"name": "Project 1"})).json()
+
+    # Create project 2 (newer, unpinned)
+    p2 = (await client.post(f"/api/v1/workspaces/{slug}/projects", json={"name": "Project 2"})).json()
+
+    # Pin project 1 via PATCH
+    patch_res = await client.patch(
+        f"/api/v1/workspaces/{slug}/projects/{p1['id']}",
+        json={"is_pinned": True}
+    )
+    assert patch_res.status_code == 200
+    assert patch_res.json()["is_pinned"] is True
+
+    # List projects: P1 should be first even though P2 is newer!
+    list_res = await client.get(f"/api/v1/workspaces/{slug}/projects")
+    projects = list_res.json()
+    assert projects[0]["id"] == p1["id"]
+    assert projects[0]["is_pinned"] is True
+
+
+@pytest.mark.asyncio
 async def test_viewer_cannot_create_project(client: AsyncClient):
     """
     Capability Guard Test:

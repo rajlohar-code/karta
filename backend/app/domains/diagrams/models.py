@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infra.database import Base
@@ -31,13 +31,24 @@ class Diagram(Base):
         doc="Internal diagram ID",
     )
 
-    # Parent Project ID
-    project_id: Mapped[int] = mapped_column(
+    # Parent Project ID (Nullable for standalone diagrams outside projects)
+    project_id: Mapped[int | None] = mapped_column(
         Integer,
         ForeignKey("projects.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
-        doc="ID of the parent project",
+        default=None,
+        doc="ID of the parent project (if inside a project folder)",
+    )
+
+    # Parent Workspace ID (Direct link for standalone diagrams)
+    workspace_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+        default=None,
+        doc="ID of the workspace (especially for standalone diagrams)",
     )
 
     # Diagram Name (e.g. 'Auth & Billing Architecture')
@@ -81,6 +92,15 @@ class Diagram(Base):
         doc="True if publicly viewable via share link",
     )
 
+    # Pinned status for quick-access favorites
+    is_pinned: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        doc="True if pinned to quick-access favorites",
+    )
+
     # Current accepted revision number (monotonically increasing: 1, 2, 3...)
     current_revision: Mapped[int] = mapped_column(
         Integer,
@@ -106,9 +126,16 @@ class Diagram(Base):
     )
 
     # Relationships
-    project: Mapped["Project"] = relationship(
+    project: Mapped["Project | None"] = relationship(
         "Project",
-        doc="Parent project object",
+        doc="Parent project object (None if standalone diagram)",
+    )
+
+    members: Mapped[list["DiagramMember"]] = relationship(
+        "DiagramMember",
+        back_populates="diagram",
+        cascade="all, delete-orphan",
+        doc="Explicit collaborators granted access to this private diagram",
     )
 
     revisions: Mapped[list["DiagramRevision"]] = relationship(
@@ -121,6 +148,62 @@ class Diagram(Base):
 
     def __repr__(self) -> str:
         return f"<Diagram id={self.id} name='{self.name}' type='{self.type}' slug='{self.slug}'>"
+
+
+class DiagramMember(Base):
+    """
+    SQLAlchemy ORM Model representing explicit collaborator assignment to a Private Diagram.
+    
+    ---------------------------------------------------------------------------
+    PBAC PRIVATE DIAGRAM ISOLATION:
+    - If a diagram is private (`is_public = False`) and outside a project:
+      Only Workspace Owner or users in this table can view/edit it.
+    ---------------------------------------------------------------------------
+    """
+    __tablename__ = "diagram_members"
+
+    __table_args__ = (
+        UniqueConstraint("diagram_id", "user_id", name="uq_diagram_user_member"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        doc="Internal diagram membership ID",
+    )
+
+    diagram_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("diagrams.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="ID of the private diagram",
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="ID of the assigned collaborator user",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Timestamp when collaborator was added to this private diagram",
+    )
+
+    # Relationship back to Diagram
+    diagram: Mapped["Diagram"] = relationship(
+        "Diagram",
+        back_populates="members",
+    )
+
+    def __repr__(self) -> str:
+        return f"<DiagramMember diagram_id={self.diagram_id} user_id={self.user_id}>"
 
 
 class DiagramRevision(Base):

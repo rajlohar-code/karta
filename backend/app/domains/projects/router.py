@@ -17,8 +17,13 @@ from app.core.capabilities import Capability
 from app.core.permissions import PermissionChecker
 from app.dependencies import get_current_user
 from app.domains.diagrams.models import Diagram
-from app.domains.projects.models import Project
-from app.domains.projects.schemas import ProjectCreate, ProjectResponse, ProjectUpdate
+from app.domains.projects.models import Project, ProjectMember
+from app.domains.projects.schemas import (
+    ProjectCreate,
+    ProjectResponse,
+    ProjectUpdate,
+    UpdateResourceMembersRequest,
+)
 from app.domains.users.models import User
 from app.domains.workspaces.models import Workspace, WorkspaceMember
 from app.infra.database import get_db
@@ -122,9 +127,20 @@ async def list_workspace_projects(
         .outerjoin(Diagram, Project.id == Diagram.project_id)
         .where(Project.workspace_id == workspace.id)
         .group_by(Project.id)
-        .order_by(Project.created_at.desc())
+        .order_by(Project.is_pinned.desc(), Project.created_at.desc())
     )
     results = (await db.execute(stmt)).all()
+
+    # Query assigned members for all projects in this workspace
+    project_ids = [proj.id for proj, _ in results]
+    members_map: dict[int, list[int]] = {pid: [] for pid in project_ids}
+    if project_ids:
+        mem_rows = (await db.execute(
+            select(ProjectMember.project_id, ProjectMember.user_id)
+            .where(ProjectMember.project_id.in_(project_ids))
+        )).all()
+        for pid, uid in mem_rows:
+            members_map[pid].append(uid)
 
     return [
         ProjectResponse(
@@ -132,6 +148,9 @@ async def list_workspace_projects(
             workspace_id=proj.workspace_id,
             name=proj.name,
             description=proj.description,
+            is_pinned=proj.is_pinned,
+            is_public=proj.is_public,
+            member_user_ids=members_map.get(proj.id, []),
             created_at=proj.created_at,
             updated_at=proj.updated_at,
             diagrams_count=count,
@@ -208,6 +227,8 @@ async def create_project(
         workspace_id=workspace.id,
         name=payload.name,
         description=payload.description,
+        is_pinned=payload.is_pinned,
+        is_public=payload.is_public,
     )
     db.add(project)
     await db.commit()
@@ -218,6 +239,9 @@ async def create_project(
         workspace_id=project.workspace_id,
         name=project.name,
         description=project.description,
+        is_pinned=project.is_pinned,
+        is_public=project.is_public,
+        member_user_ids=[],
         created_at=project.created_at,
         updated_at=project.updated_at,
         diagrams_count=0,
@@ -255,11 +279,20 @@ async def get_project(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
 
     project, count = res
+
+    # Query assigned members for this project
+    mem_rows = (await db.execute(
+        select(ProjectMember.user_id).where(ProjectMember.project_id == project.id)
+    )).scalars().all()
+
     return ProjectResponse(
         id=project.id,
         workspace_id=project.workspace_id,
         name=project.name,
         description=project.description,
+        is_pinned=project.is_pinned,
+        is_public=project.is_public,
+        member_user_ids=list(mem_rows),
         created_at=project.created_at,
         updated_at=project.updated_at,
         diagrams_count=count,
@@ -284,7 +317,7 @@ async def update_project(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Update project name or description. Requires Capability.EDIT_DIAGRAM."""
+    """Update project name, description, pinned status, or public/private toggle. Requires Capability.EDIT_DIAGRAM."""
     workspace, user_role = await _get_workspace_and_verify_membership(slug, current_user.id, db)
 
     if not PermissionChecker.is_permitted(user_role, Capability.EDIT_DIAGRAM):
@@ -301,6 +334,10 @@ async def update_project(
         project.name = payload.name
     if payload.description is not None:
         project.description = payload.description
+    if payload.is_pinned is not None:
+        project.is_pinned = payload.is_pinned
+    if payload.is_public is not None:
+        project.is_public = payload.is_public
 
     await db.commit()
     await db.refresh(project)
@@ -311,11 +348,99 @@ async def update_project(
     )
     diagrams_count = count_res.scalar_one()
 
+    # Query assigned members
+    mem_rows = (await db.execute(
+        select(ProjectMember.user_id).where(ProjectMember.project_id == project.id)
+    )).scalars().all()
+
     return ProjectResponse(
         id=project.id,
         workspace_id=project.workspace_id,
         name=project.name,
         description=project.description,
+        is_pinned=project.is_pinned,
+        is_public=project.is_public,
+        member_user_ids=list(mem_rows),
+        created_at=project.created_at,
+        updated_at=project.updated_at,
+        diagrams_count=diagrams_count,
+    )
+
+
+# -----------------------------------------------------------------------------
+# 5. Assign Collaborators to a Private Project
+# -----------------------------------------------------------------------------
+@router.put(
+    "/{project_id}/members",
+    response_model=ProjectResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update assigned collaborators on a private project",
+)
+@log_endpoint(folder_name="projects", file_name="projects.log")
+async def update_project_members(
+    slug: str,
+    project_id: int,
+    payload: UpdateResourceMembersRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Set explicit collaborator user IDs for a private project.
+    Requires workspace creator OR 'can_add_members_to_private_projects_if_added'.
+    """
+    workspace, _ = await _get_workspace_and_verify_membership(slug, current_user.id, db)
+
+    proj_res = await db.execute(
+        select(Project).where(Project.id == project_id, Project.workspace_id == workspace.id)
+    )
+    project = proj_res.scalar_one_or_none()
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    # Fetch current user membership
+    curr_mem_res = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    curr_mem = curr_mem_res.scalar_one_or_none()
+
+    # Permission check: Owner OR can_add_members_to_private_projects_if_added
+    can_manage = (current_user.id == workspace.owner_id) or (
+        curr_mem and curr_mem.permissions.get("can_add_members_to_private_projects_if_added", False) is True
+    )
+    if not can_manage:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: You do not have permission to manage private project collaborators"
+        )
+
+    # Delete existing project members
+    from sqlalchemy import delete
+    await db.execute(delete(ProjectMember).where(ProjectMember.project_id == project.id))
+
+    # Add new project members
+    for uid in payload.member_user_ids:
+        db.add(ProjectMember(project_id=project.id, user_id=uid))
+
+    await db.commit()
+    await db.refresh(project)
+
+    count_res = await db.execute(
+        select(func.count(Diagram.id)).where(Diagram.project_id == project.id)
+    )
+    diagrams_count = count_res.scalar_one()
+
+    return ProjectResponse(
+        id=project.id,
+        workspace_id=project.workspace_id,
+        name=project.name,
+        description=project.description,
+        is_pinned=project.is_pinned,
+        is_public=project.is_public,
+        member_user_ids=payload.member_user_ids,
         created_at=project.created_at,
         updated_at=project.updated_at,
         diagrams_count=diagrams_count,

@@ -29,7 +29,7 @@ from app.core.commands.base import (
 from app.core.commands.schema_commands import AddTableCommand
 from app.core.permissions import PermissionChecker
 from app.dependencies import get_current_user, get_current_user_optional
-from app.domains.diagrams.models import Diagram, DiagramRevision
+from app.domains.diagrams.models import Diagram, DiagramMember, DiagramRevision
 from app.domains.diagrams.schemas import (
     DiagramCreate,
     DiagramDetailResponse,
@@ -39,6 +39,7 @@ from app.domains.diagrams.schemas import (
     ExecuteCommandRequest,
 )
 from app.domains.projects.models import Project
+from app.domains.projects.schemas import UpdateResourceMembersRequest
 from app.domains.users.models import User
 from app.domains.workspaces.models import Workspace, WorkspaceMember
 from app.infra.database import get_db
@@ -171,7 +172,7 @@ async def list_project_diagrams(
     stmt = (
         select(Diagram)
         .where(Diagram.project_id == project_id)
-        .order_by(Diagram.created_at.desc())
+        .order_by(Diagram.is_pinned.desc(), Diagram.created_at.desc())
     )
     results = (await db.execute(stmt)).scalars().all()
     return results
@@ -216,6 +217,7 @@ async def create_diagram(
         slug=slug,
         creator_id=current_user.id,
         is_public=payload.is_public,
+        is_pinned=payload.is_pinned,
         current_revision=1,
     )
     db.add(diagram)
@@ -332,6 +334,8 @@ async def update_diagram(
         diagram.name = payload.name
     if payload.is_public is not None:
         diagram.is_public = payload.is_public
+    if payload.is_pinned is not None:
+        diagram.is_pinned = payload.is_pinned
 
     await db.commit()
     await db.refresh(diagram)
@@ -358,6 +362,40 @@ async def delete_diagram(
     await db.delete(diagram)
     await db.commit()
     return {"status": "ok", "message": "Diagram deleted successfully"}
+
+
+# -----------------------------------------------------------------------------
+# 5b. Assign Collaborators to a Private Diagram
+# -----------------------------------------------------------------------------
+@diagrams_router.put(
+    "/{slug}/members",
+    status_code=status.HTTP_200_OK,
+    summary="Update assigned collaborators on a private diagram",
+)
+@log_endpoint(folder_name="diagrams", file_name="diagrams.log")
+async def update_diagram_members(
+    slug: str,
+    payload: UpdateResourceMembersRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Set explicit collaborator user IDs for a private diagram.
+    Requires Capability.EDIT_DIAGRAM.
+    """
+    diagram, _ = await _get_diagram_and_check_access(slug, current_user, db, require_edit=True)
+
+    # Delete existing diagram members
+    from sqlalchemy import delete
+    await db.execute(delete(DiagramMember).where(DiagramMember.diagram_id == diagram.id))
+
+    # Add new diagram members
+    for uid in payload.member_user_ids:
+        db.add(DiagramMember(diagram_id=diagram.id, user_id=uid))
+
+    await db.commit()
+    return {"status": "ok", "member_user_ids": payload.member_user_ids}
 
 
 # -----------------------------------------------------------------------------

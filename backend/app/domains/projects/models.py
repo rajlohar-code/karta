@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import DateTime, ForeignKey, Integer, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infra.database import Base
 
@@ -52,6 +52,24 @@ class Project(Base):
         doc="Optional brief summary of the project",
     )
 
+    # Public vs Private Project (by default private per PBAC requirements)
+    is_public: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        doc="True if public to all workspace collaborators; False if private",
+    )
+
+    # Pinned status for quick sidebar access
+    is_pinned: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+        doc="True if pinned to quick-access favorites",
+    )
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -74,5 +92,72 @@ class Project(Base):
         doc="Parent workspace object",
     )
 
+    # Explicit collaborators assigned to this private project
+    members: Mapped[list["ProjectMember"]] = relationship(
+        "ProjectMember",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        doc="Explicit collaborators granted access to this private project",
+    )
+
     def __repr__(self) -> str:
-        return f"<Project id={self.id} name='{self.name}' workspace_id={self.workspace_id}>"
+        return f"<Project id={self.id} name='{self.name}' workspace_id={self.workspace_id} is_public={self.is_public}>"
+
+
+class ProjectMember(Base):
+    """
+    SQLAlchemy ORM Model representing explicit collaborator assignment to a Private Project.
+    
+    ---------------------------------------------------------------------------
+    PBAC PRIVATE PROJECT ISOLATION:
+    - If a project is private (`is_public = False`), only:
+        1. Workspace Owner / Admins
+        2. Collaborators explicitly added in this `project_members` table
+      can view, inspect, or manage items inside this project.
+    ---------------------------------------------------------------------------
+    """
+    __tablename__ = "project_members"
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "user_id", name="uq_project_user_member"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=True,
+        doc="Internal project membership ID",
+    )
+
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="ID of the private project",
+    )
+
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+        doc="ID of the assigned collaborator user",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        doc="Timestamp when collaborator was added to this private project",
+    )
+
+    # Relationship back to Project
+    project: Mapped["Project"] = relationship(
+        "Project",
+        back_populates="members",
+    )
+
+    def __repr__(self) -> str:
+        return f"<ProjectMember project_id={self.project_id} user_id={self.user_id}>"
+

@@ -1,7 +1,29 @@
 from datetime import datetime
 from sqlalchemy import DateTime, ForeignKey, Integer, String, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.infra.database import Base
+
+# -----------------------------------------------------------------------------
+# Default PBAC Capabilities (13 Granular Boolean Flags)
+# Grounded in: frontend/src/types/workspace.ts & karta_security.md (Layer 2)
+# By default, invited collaborators can ONLY view public diagrams.
+# -----------------------------------------------------------------------------
+DEFAULT_MEMBER_PERMISSIONS: dict[str, bool] = {
+    "can_view_public_diagrams": True,
+    "can_create_schemas": False,
+    "can_create_flowcharts": False,
+    "can_create_public_diagrams": False,
+    "can_edit_public_schemas": False,
+    "can_edit_private_diagrams_if_added": False,
+    "can_create_public_projects": False,
+    "can_create_private_projects": False,
+    "can_add_members_to_private_projects_if_added": False,
+    "can_use_readonly_ai": False,
+    "can_use_ai_generation": False,
+    "can_view_permissions": False,
+    "can_edit_permissions": False,
+}
 
 
 class Workspace(Base):
@@ -131,6 +153,15 @@ class WorkspaceMember(Base):
         doc="Workspace-scoped role ('owner', 'editor', 'viewer')",
     )
 
+    # Fine-grained PBAC Capabilities (13 Granular Boolean Flags stored in JSONB)
+    permissions: Mapped[dict[str, bool]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: dict(DEFAULT_MEMBER_PERMISSIONS),
+        server_default="{}",
+        doc="PBAC 13 granular boolean permissions",
+    )
+
     joined_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -191,6 +222,15 @@ class WorkspaceInvitation(Base):
         nullable=False,
         default="editor",
         doc="Assigned role: 'editor' or 'viewer'",
+    )
+
+    # Configured PBAC permissions to be granted upon invitation acceptance
+    permissions: Mapped[dict[str, bool]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: dict(DEFAULT_MEMBER_PERMISSIONS),
+        server_default="{}",
+        doc="Granular permissions granted to collaborator when they accept",
     )
 
     token: Mapped[str] = mapped_column(

@@ -20,14 +20,21 @@ from app.core.capabilities import Capability
 from app.core.permissions import PermissionChecker
 from app.dependencies import get_current_user
 from app.domains.users.models import User
-from app.domains.workspaces.models import Workspace, WorkspaceInvitation, WorkspaceMember
+from app.domains.workspaces.models import (
+    DEFAULT_MEMBER_PERMISSIONS,
+    Workspace,
+    WorkspaceInvitation,
+    WorkspaceMember,
+)
 from app.domains.workspaces.schemas import (
     AcceptInvitationResponse,
     AddMemberRequest,
     CreateInvitationRequest,
+    UpdateMemberPermissionsRequest,
     WorkspaceCreate,
     WorkspaceInvitationResponse,
     WorkspaceMemberResponse,
+    WorkspacePermissionsSchema,
     WorkspaceResponse,
     WorkspaceUpdate,
 )
@@ -447,6 +454,8 @@ async def list_workspace_members(
             name=user.name,
             avatar_url=user.avatar_url,
             role=membership.role,
+            is_owner=(user.id == workspace.owner_id),
+            permissions=WorkspacePermissionsSchema(**(membership.permissions or DEFAULT_MEMBER_PERMISSIONS)),
             joined_at=membership.joined_at,
         )
         for membership, user in rows
@@ -471,8 +480,8 @@ async def add_workspace_member(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Invite or add a user to a workspace with a designated role ('editor' or 'viewer').
-    Requires Capability.INVITE_MEMBERS (Owner permission).
+    Invite or add a user to a workspace with designated capabilities.
+    Requires Capability.INVITE_MEMBERS (Owner/Admin permission).
     """
     # 1. Fetch workspace
     res = await db.execute(select(Workspace).where(Workspace.slug == slug))
@@ -482,17 +491,23 @@ async def add_workspace_member(
 
     # 2. Check current user's role and capability
     curr_mem = await db.execute(
-        select(WorkspaceMember.role).where(
+        select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace.id,
             WorkspaceMember.user_id == current_user.id
         )
     )
-    current_role = curr_mem.scalar_one_or_none()
-    if not current_role:
+    actor_mem = curr_mem.scalar_one_or_none()
+    if not actor_mem:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     # Capability check using core permission engine
-    if not PermissionChecker.is_permitted(current_role, Capability.INVITE_MEMBERS):
+    if not PermissionChecker.is_permitted(
+        role=actor_mem.role,
+        capability=Capability.EDIT_PERMISSIONS,
+        custom_grants=actor_mem.permissions,
+        user_id=current_user.id,
+        workspace_owner_id=workspace.owner_id,
+    ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Permission denied: You do not have permission to invite members"
@@ -521,10 +536,16 @@ async def add_workspace_member(
         )
 
     # 5. Add membership record
+    initial_perms = (
+        payload.permissions.model_dump()
+        if payload.permissions
+        else dict(DEFAULT_MEMBER_PERMISSIONS)
+    )
     new_member = WorkspaceMember(
         workspace_id=workspace.id,
         user_id=target_user.id,
         role=payload.role,
+        permissions=initial_perms,
     )
     db.add(new_member)
     await db.commit()
@@ -537,8 +558,194 @@ async def add_workspace_member(
         name=target_user.name,
         avatar_url=target_user.avatar_url,
         role=new_member.role,
+        is_owner=(target_user.id == workspace.owner_id),
+        permissions=WorkspacePermissionsSchema(**new_member.permissions),
         joined_at=new_member.joined_at,
     )
+
+
+# -----------------------------------------------------------------------------
+# 7. Update Collaborator Permissions (PBAC)
+# -----------------------------------------------------------------------------
+@router.patch(
+    "/{slug}/members/{user_id}/permissions",
+    response_model=WorkspaceMemberResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update fine-grained capability permissions of a collaborator",
+)
+@log_endpoint(folder_name="workspaces", file_name="workspaces.log")
+async def update_member_permissions(
+    slug: str,
+    user_id: int,
+    payload: UpdateMemberPermissionsRequest,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Update the 13 boolean capability flags for a specific collaborator.
+    
+    ---------------------------------------------------------------------------
+    SECURITY GUARDS:
+    - Actor must be workspace owner OR hold 'can_edit_permissions'.
+    - Target user CANNOT be the primary workspace owner (creator permissions are immutable).
+    ---------------------------------------------------------------------------
+    """
+    # 1. Fetch workspace
+    res = await db.execute(select(Workspace).where(Workspace.slug == slug))
+    workspace = res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    # 2. Check actor's authorization
+    curr_mem = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    actor_mem = curr_mem.scalar_one_or_none()
+    if not actor_mem:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    can_edit = PermissionChecker.is_permitted(
+        role=actor_mem.role,
+        capability=Capability.EDIT_PERMISSIONS,
+        custom_grants=actor_mem.permissions,
+        user_id=current_user.id,
+        workspace_owner_id=workspace.owner_id,
+    )
+    if not can_edit:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: You do not have permission to edit collaborator permissions"
+        )
+
+    # 3. Guard: Cannot modify the primary owner's permissions!
+    if user_id == workspace.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify permissions of the workspace creator"
+        )
+
+    # 4. Find target membership record
+    target_mem_res = await db.execute(
+        select(WorkspaceMember, User)
+        .join(User, WorkspaceMember.user_id == User.id)
+        .where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == user_id
+        )
+    )
+    target_row = target_mem_res.first()
+    if not target_row:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collaborator not found in this workspace"
+        )
+    target_membership, target_user = target_row
+
+    # 5. Apply updated permissions
+    target_membership.permissions = payload.permissions.model_dump()
+    await db.commit()
+    await db.refresh(target_membership)
+
+    return WorkspaceMemberResponse(
+        id=target_membership.id,
+        user_id=target_user.id,
+        email=target_user.email,
+        name=target_user.name,
+        avatar_url=target_user.avatar_url,
+        role=target_membership.role,
+        is_owner=False,
+        permissions=WorkspacePermissionsSchema(**target_membership.permissions),
+        joined_at=target_membership.joined_at,
+    )
+
+
+# -----------------------------------------------------------------------------
+# 8. Remove Collaborator from Workspace
+# -----------------------------------------------------------------------------
+@router.delete(
+    "/{slug}/members/{user_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Remove a collaborator from a workspace",
+)
+@log_endpoint(folder_name="workspaces", file_name="workspaces.log")
+async def remove_workspace_member(
+    slug: str,
+    user_id: int,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Remove a collaborator from this workspace.
+    
+    ---------------------------------------------------------------------------
+    SECURITY GUARDS:
+    - Primary Owner CANNOT be removed by anyone (including themselves).
+    - Actor must be workspace owner OR hold 'can_edit_permissions'.
+    ---------------------------------------------------------------------------
+    """
+    # 1. Fetch workspace
+    res = await db.execute(select(Workspace).where(Workspace.slug == slug))
+    workspace = res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    # 2. Guard: Primary Owner CANNOT be removed!
+    if user_id == workspace.owner_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The workspace creator cannot be removed from the workspace"
+        )
+
+    # 3. Check actor's authorization
+    curr_mem = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == current_user.id
+        )
+    )
+    actor_mem = curr_mem.scalar_one_or_none()
+    if not actor_mem:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+
+    is_self = (current_user.id == user_id)
+    is_admin = PermissionChecker.is_permitted(
+        role=actor_mem.role,
+        capability=Capability.EDIT_PERMISSIONS,
+        custom_grants=actor_mem.permissions,
+        user_id=current_user.id,
+        workspace_owner_id=workspace.owner_id,
+    )
+
+    if not is_self and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: You do not have permission to remove collaborators"
+        )
+
+    # 4. Fetch target membership
+    target_mem = await db.execute(
+        select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == user_id
+        )
+    )
+    membership_to_delete = target_mem.scalar_one_or_none()
+    if not membership_to_delete:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Collaborator not found in this workspace"
+        )
+
+    # 5. Delete membership
+    await db.delete(membership_to_delete)
+    await db.commit()
+
+    return {"message": "Collaborator removed successfully", "user_id": user_id}
 
 
 # -----------------------------------------------------------------------------

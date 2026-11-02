@@ -113,3 +113,21 @@ async def test_logout_invalidates_session_cookie(client: AsyncClient):
     # Cookie should have Max-Age=0 or past expires date
     set_cookie = response.headers.get("set-cookie", "")
     assert "Max-Age=0" in set_cookie or "expires=" in set_cookie.lower()
+
+
+@pytest.mark.asyncio
+async def test_google_login_redirect_url(client: AsyncClient):
+    """
+    OAuth Test:
+    Calling /api/v1/auth/google/login must redirect (307) to Google OAuth consent page
+    with correct client_id, scope, and redirect_uri parameters.
+    """
+    response = await client.get("/api/v1/auth/google/login", follow_redirects=False)
+    
+    assert response.status_code == 307
+    location = response.headers.get("location", "")
+    assert "accounts.google.com/o/oauth2/v2/auth" in location
+    assert "client_id=" in location
+    assert "scope=openid+email+profile" in location or "scope=openid%20email%20profile" in location
+    assert "redirect_uri=" in location
+

@@ -34,6 +34,10 @@ class DiagramBase(BaseModel):
         default=False,
         description="If True, anyone with the shareable link can view in read-only mode"
     )
+    is_pinned: bool = Field(
+        default=False,
+        description="True if pinned to favorites"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -41,17 +45,25 @@ class DiagramBase(BaseModel):
 # -----------------------------------------------------------------------------
 class DiagramCreate(DiagramBase):
     """
-    Request payload to create a new diagram inside a project.
+    Request payload to create a new diagram inside a project or as standalone.
     
-    POST /api/v1/projects/{project_id}/diagrams
+    POST /api/v1/projects/{project_id}/diagrams OR /api/v1/workspaces/{slug}/diagrams
     Payload:
       {
         "name": "User Authentication ERD",
         "type": "schema",
-        "is_public": false
+        "is_public": false,
+        "is_pinned": false
       }
     """
-    pass
+    project_id: int | None = Field(
+        default=None,
+        description="Parent project ID (None if standalone diagram)"
+    )
+    workspace_id: int | None = Field(
+        default=None,
+        description="Parent workspace ID (for standalone diagrams)"
+    )
 
 
 class DiagramUpdate(BaseModel):
@@ -62,7 +74,8 @@ class DiagramUpdate(BaseModel):
     Payload:
       {
         "name": "Renamed Diagram",
-        "is_public": true
+        "is_public": true,
+        "is_pinned": true
       }
     """
     model_config = ConfigDict(extra="forbid")
@@ -77,6 +90,10 @@ class DiagramUpdate(BaseModel):
         default=None,
         description="Updated public shareable toggle"
     )
+    is_pinned: bool | None = Field(
+        default=None,
+        description="Toggle pinned status"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -90,12 +107,17 @@ class DiagramSummaryResponse(DiagramBase):
     model_config = ConfigDict(from_attributes=True, extra="forbid")
 
     id: int = Field(description="Internal diagram ID")
-    project_id: int = Field(description="Parent project ID")
+    project_id: int | None = Field(default=None, description="Parent project ID (None if standalone)")
+    workspace_id: int | None = Field(default=None, description="Parent workspace ID")
     slug: str = Field(description="Unguessable URL slug for deep routing (e.g. 'd_9xK2mP1q')")
     creator_id: int | None = Field(default=None, description="Creator user ID")
     current_revision: int = Field(description="Latest revision number")
     created_at: datetime = Field(description="Creation timestamp in UTC")
     updated_at: datetime = Field(description="Last update timestamp in UTC")
+    member_user_ids: list[int] = Field(
+        default_factory=list,
+        description="IDs of collaborators assigned to this private diagram"
+    )
 
 
 class DiagramDetailResponse(DiagramSummaryResponse):

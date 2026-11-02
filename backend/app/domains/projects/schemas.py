@@ -29,6 +29,14 @@ class ProjectBase(BaseModel):
         description="Optional developer notes or description of the project",
         examples=["PostgreSQL database schemas and microservice flowcharts"]
     )
+    is_public: bool = Field(
+        default=False,
+        description="True if public to all workspace collaborators; False if private"
+    )
+    is_pinned: bool = Field(
+        default=False,
+        description="True if pinned to quick-access favorites sidebar"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -42,7 +50,8 @@ class ProjectCreate(ProjectBase):
     Payload:
       {
         "name": "Payments Microservice",
-        "description": "Schemas and flowcharts for Razorpay integration"
+        "description": "Schemas and flowcharts for Razorpay integration",
+        "is_pinned": false
       }
     """
     pass
@@ -56,7 +65,8 @@ class ProjectUpdate(BaseModel):
     Payload:
       {
         "name": "Updated Project Name",
-        "description": "Updated description"
+        "description": "Updated description",
+        "is_pinned": true
       }
     """
     model_config = ConfigDict(extra="forbid")
@@ -71,6 +81,32 @@ class ProjectUpdate(BaseModel):
         default=None,
         max_length=512,
         description="Updated project description"
+    )
+    is_public: bool | None = Field(
+        default=None,
+        description="Toggle public/private status"
+    )
+    is_pinned: bool | None = Field(
+        default=None,
+        description="Toggle pinned status"
+    )
+
+
+class UpdateResourceMembersRequest(BaseModel):
+    """
+    Request payload to explicitly assign collaborators to a private project or diagram.
+    
+    PUT /api/v1/projects/{project_id}/members
+    Payload:
+      {
+        "member_user_ids": [1, 2, 5]
+      }
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    member_user_ids: list[int] = Field(
+        default_factory=list,
+        description="List of user IDs granted access to this private resource"
     )
 
 
@@ -91,3 +127,7 @@ class ProjectResponse(ProjectBase):
     created_at: datetime = Field(description="Creation timestamp in UTC")
     updated_at: datetime = Field(description="Last update timestamp in UTC")
     diagrams_count: int = Field(default=0, description="Number of diagrams inside this project")
+    member_user_ids: list[int] = Field(
+        default_factory=list,
+        description="List of user IDs granted access to this private project"
+    )

@@ -21,9 +21,9 @@ from app.infra.database import Base, engine
 # Import all domain models so SQLAlchemy Base knows about all tables!
 # When adding new models in the future, import them here.
 from app.domains.users.models import User
-from app.domains.workspaces.models import Workspace, WorkspaceMember
-from app.domains.projects.models import Project
-from app.domains.diagrams.models import Diagram, DiagramRevision
+from app.domains.workspaces.models import Workspace, WorkspaceMember, WorkspaceInvitation
+from app.domains.projects.models import Project, ProjectMember
+from app.domains.diagrams.models import Diagram, DiagramRevision, DiagramMember
 
 
 
@@ -78,6 +78,15 @@ async def sync_code_to_postgres():
     async with engine.begin() as conn:
         # run_sync bridges async SQLAlchemy with the synchronous DDL schema generation
         await conn.run_sync(Base.metadata.create_all)
+        # Safe incremental column additions for development
+        from sqlalchemy import text
+        await conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN NOT NULL DEFAULT false;"))
+        await conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS is_public BOOLEAN NOT NULL DEFAULT false;"))
+        await conn.execute(text("ALTER TABLE diagrams ADD COLUMN IF NOT EXISTS is_pinned BOOLEAN NOT NULL DEFAULT false;"))
+        await conn.execute(text("ALTER TABLE diagrams ADD COLUMN IF NOT EXISTS workspace_id INTEGER REFERENCES workspaces(id) ON DELETE CASCADE;"))
+        await conn.execute(text("ALTER TABLE diagrams ALTER COLUMN project_id DROP NOT NULL;"))
+        await conn.execute(text("ALTER TABLE workspace_members ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;"))
+        await conn.execute(text("ALTER TABLE workspace_invitations ADD COLUMN IF NOT EXISTS permissions JSONB NOT NULL DEFAULT '{}'::jsonb;"))
     print("  ✓ Base.metadata.create_all executed cleanly!")
 
     # -------------------------------------------------------------------------
