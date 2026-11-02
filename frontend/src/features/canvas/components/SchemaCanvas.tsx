@@ -55,9 +55,17 @@ import {
   deleteProjectApi,
 } from '../../../api/projects';
 import {
+  listWorkspaceDiagrams,
+  createWorkspaceDiagram,
+  renameDiagramApi,
+  togglePinDiagramApi,
+  deleteDiagramApi,
+} from '../../../api/diagrams';
+import {
   getWorkspaceCollaborators,
   updateCollaboratorPermissions,
   removeCollaborator,
+  sendWorkspaceInvitation,
 } from '../../../api/collaborators';
 import {
   updateProjectMembers,
@@ -669,19 +677,35 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
     setIsInviteModalOpen(true);
   };
 
-  const handleSendInviteSubmit = (email: string, permissions: WorkspacePermissions) => {
+  const handleSendInviteSubmit = async (email: string, permissions: WorkspacePermissions) => {
     setIsSendingInvite(true);
-    const newMember: WorkspaceMemberItem = {
-      id: Date.now(),
-      name: email.split('@')[0],
-      email,
-      joined_at: new Date().toISOString().split('T')[0],
-      permissions,
-    };
-    setWorkspaceMembers((prev) => [...prev, newMember]);
-    setIsSendingInvite(false);
-    setIsInviteModalOpen(false);
-    alert(`Invitation sent to ${email}! Member has been granted selected capabilities.`);
+    const trimmedEmail = email.trim();
+
+    if (activeWorkspace?.slug && user) {
+      try {
+        const inviteRes = await sendWorkspaceInvitation(activeWorkspace.slug, trimmedEmail, permissions);
+        alert(`Invitation link created for ${trimmedEmail}!\n\nLink: ${inviteRes.invitation_link}`);
+        setIsInviteModalOpen(false);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to send invitation';
+        console.error('Failed to send invitation on backend:', err);
+        alert(msg);
+      } finally {
+        setIsSendingInvite(false);
+      }
+    } else {
+      const newMember: WorkspaceMemberItem = {
+        id: Date.now(),
+        name: trimmedEmail.split('@')[0],
+        email: trimmedEmail,
+        joined_at: new Date().toISOString().split('T')[0],
+        permissions,
+      };
+      setWorkspaceMembers((prev) => [...prev, newMember]);
+      setIsSendingInvite(false);
+      setIsInviteModalOpen(false);
+      alert(`Invitation sent to ${trimmedEmail}! Member has been granted selected capabilities.`);
+    }
   };
 
   const handleUpdateMemberPermissions = async (userId: number, permissions: WorkspacePermissions) => {
@@ -848,6 +872,31 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
       localStorage.setItem(STORAGE_KEYS.LAST_DIAGRAM, activeDiagramSlug);
     }
   }, [activeDiagramSlug]);
+
+  // Load workspace diagrams from backend API whenever active workspace changes
+  useEffect(() => {
+    if (!activeWorkspace?.slug || !user) return;
+    let isMounted = true;
+
+    listWorkspaceDiagrams(activeWorkspace.slug)
+      .then((backendDiagrams) => {
+        if (isMounted && backendDiagrams && backendDiagrams.length > 0) {
+          setDiagrams(backendDiagrams);
+          // Preserve currently selected diagram if it exists in this workspace, else pick first
+          setActiveDiagramSlug((curr) => {
+            const exists = backendDiagrams.find((d) => d.slug === curr);
+            return exists ? curr : backendDiagrams[0].slug;
+          });
+        }
+      })
+      .catch((err) => {
+        console.warn('Backend diagrams fetch skipped/failed, using local state:', err?.message || err);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [activeWorkspace?.slug, user]);
 
   const activeDiagram = useMemo(() => {
     return diagrams.find((d) => d.slug === activeDiagramSlug) || diagrams[0] || null;
@@ -1016,7 +1065,7 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
   // ---------------------------------------------------------------------------
   // 6. Diagram Creation & Default Numbering Logic: unnamed_diagram_1, 2, ...
   // ---------------------------------------------------------------------------
-  const handleCreateDiagram = (type: 'schema' | 'flowchart', projectId?: number) => {
+  const handleCreateDiagram = async (type: 'schema' | 'flowchart', projectId?: number) => {
     let maxIndex = 0;
     const unnamedRegex = /^unnamed_diagram(?:_(\d+))?$/i;
 
@@ -1030,49 +1079,91 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
 
     const nextIndex = maxIndex + 1;
     const newName = `unnamed_diagram_${nextIndex}`;
-    const newSlug = `d_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
 
-    const newDiagram: DiagramItem = {
-      id: Date.now(),
-      name: newName,
-      slug: newSlug,
-      type,
-      is_pinned: false,
-      is_public: false,
-      member_user_ids: [1],
-      project_id: projectId ?? null,
-      updated_at: 'Just now',
-    };
+    if (activeWorkspace?.slug && user) {
+      try {
+        const createdDiag = await createWorkspaceDiagram(
+          activeWorkspace.slug,
+          newName,
+          type,
+          projectId
+        );
+        setDiagrams((prev) => [createdDiag, ...prev]);
 
-    setDiagrams((prev) => [newDiagram, ...prev]);
+        // Blank initial local cache
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${createdDiag.slug}_nodes`, JSON.stringify([]));
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${createdDiag.slug}_edges`, JSON.stringify([]));
 
-    // Set initial nodes for blank diagram
-    if (type === 'schema') {
-      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify([]));
-      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify([]));
+        setActiveDiagramSlug(createdDiag.slug);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to create diagram';
+        console.error('Failed to create diagram on backend:', err);
+        alert(msg);
+      }
     } else {
-      const starterNode: Node[] = [
-        {
-          id: 'flow_start',
-          type: 'flowNode',
-          position: { x: 300, y: 120 },
-          data: { label: 'Start Flow', node_type: 'terminal', status: 'start' },
-        },
-      ];
-      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify(starterNode));
-      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify([]));
-    }
+      const newSlug = `d_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      const newDiagram: DiagramItem = {
+        id: Date.now(),
+        name: newName,
+        slug: newSlug,
+        type,
+        is_pinned: false,
+        is_public: false,
+        member_user_ids: user ? [user.id] : [1],
+        project_id: projectId ?? null,
+        updated_at: 'Just now',
+      };
 
-    setActiveDiagramSlug(newSlug);
+      setDiagrams((prev) => [newDiagram, ...prev]);
+
+      // Set initial nodes for blank diagram
+      if (type === 'schema') {
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify([]));
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify([]));
+      } else {
+        const starterNode: Node[] = [
+          {
+            id: 'flow_start',
+            type: 'flowNode',
+            position: { x: 300, y: 120 },
+            data: { label: 'Start Flow', node_type: 'terminal', status: 'start' },
+          },
+        ];
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify(starterNode));
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify([]));
+      }
+
+      setActiveDiagramSlug(newSlug);
+    }
   };
 
   // ---------------------------------------------------------------------------
   // 7. Diagram & Project Actions (Rename, Delete, Move, Pin)
   // ---------------------------------------------------------------------------
-  const handleRenameDiagram = (diagramId: number, newName: string) => {
+  const handleRenameDiagram = async (diagramId: number, newName: string) => {
+    const trimmed = newName.trim();
+    if (!trimmed) return;
+
+    const target = diagrams.find((d) => d.id === diagramId);
+    if (!target) return;
+
+    // 1. Optimistic update
+    const prevDiagrams = diagrams;
     setDiagrams((prev) =>
-      prev.map((d) => (d.id === diagramId ? { ...d, name: newName, updated_at: 'Just now' } : d))
+      prev.map((d) => (d.id === diagramId ? { ...d, name: trimmed, updated_at: 'Just now' } : d))
     );
+
+    // 2. Persist to Backend API
+    if (target.slug && user) {
+      try {
+        await renameDiagramApi(target.slug, trimmed);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to rename diagram';
+        console.error('Failed to rename diagram on backend:', err);
+        alert(msg);
+        setDiagrams(prevDiagrams); // Rollback
+      }
+    }
   };
 
   const handleDuplicateDiagram = (diagramId: number) => {
@@ -1140,14 +1231,33 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
     setActiveMainTab('canvas');
   };
 
-  const handleDeleteDiagram = (diagramId: number) => {
-    setDiagrams((prev) => {
-      const remaining = prev.filter((d) => d.id !== diagramId);
-      if (activeDiagram?.id === diagramId && remaining.length > 0) {
-        setActiveDiagramSlug(remaining[0].slug);
+  const handleDeleteDiagram = async (diagramId: number) => {
+    const target = diagrams.find((d) => d.id === diagramId);
+    if (!target) return;
+
+    if (!confirm(`Are you sure you want to delete "${target.name}"?`)) {
+      return;
+    }
+
+    // 1. Optimistic update
+    const prevDiagrams = diagrams;
+    const remaining = diagrams.filter((d) => d.id !== diagramId);
+    setDiagrams(remaining);
+    if (activeDiagram?.id === diagramId && remaining.length > 0) {
+      setActiveDiagramSlug(remaining[0].slug);
+    }
+
+    // 2. Persist to Backend API
+    if (target.slug && user) {
+      try {
+        await deleteDiagramApi(target.slug);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to delete diagram';
+        console.error('Failed to delete diagram on backend:', err);
+        alert(msg);
+        setDiagrams(prevDiagrams); // Rollback
       }
-      return remaining;
-    });
+    }
   };
 
   const handleMoveDiagram = (diagramId: number, targetProjectId: number | null) => {
@@ -1156,10 +1266,28 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
     );
   };
 
-  const handleTogglePinDiagram = (diagramId: number) => {
+  const handleTogglePinDiagram = async (diagramId: number) => {
+    const target = diagrams.find((d) => d.id === diagramId);
+    if (!target) return;
+    const nextPinned = !target.is_pinned;
+
+    // 1. Optimistic update
+    const prevDiagrams = diagrams;
     setDiagrams((prev) =>
-      prev.map((d) => (d.id === diagramId ? { ...d, is_pinned: !d.is_pinned } : d))
+      prev.map((d) => (d.id === diagramId ? { ...d, is_pinned: nextPinned } : d))
     );
+
+    // 2. Persist to Backend API
+    if (target.slug && user) {
+      try {
+        await togglePinDiagramApi(target.slug, nextPinned);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to toggle diagram pin';
+        console.error('Failed to toggle diagram pin on backend:', err);
+        alert(msg);
+        setDiagrams(prevDiagrams); // Rollback
+      }
+    }
   };
 
   const handleCreateProject = async (projectName: string) => {

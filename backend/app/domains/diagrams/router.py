@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import secrets
 from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -45,8 +45,9 @@ from app.domains.workspaces.models import Workspace, WorkspaceMember
 from app.infra.database import get_db
 from app.services.log_service import log_endpoint
 
-# Create two routers: one for project-nested creation/listing, one for slug-based canvas actions
+# Create routers: project-nested, workspace-level, and slug-based canvas actions
 project_diagrams_router = APIRouter(prefix="/api/v1/projects/{project_id}/diagrams", tags=["Diagrams"])
+workspace_diagrams_router = APIRouter(prefix="/api/v1/workspaces/{slug}/diagrams", tags=["Diagrams"])
 diagrams_router = APIRouter(prefix="/api/v1/diagrams", tags=["Diagrams"])
 
 # Registry of supported Diagram Commands
@@ -93,6 +94,33 @@ async def _get_project_and_verify_membership(
     return project, workspace, user_role
 
 
+async def _get_workspace_and_verify_membership(
+    slug: str,
+    user_id: int,
+    db: AsyncSession,
+) -> tuple[Workspace, str]:
+    """Helper: Verifies workspace exists and user is an active workspace member."""
+    ws_res = await db.execute(select(Workspace).where(Workspace.slug == slug))
+    workspace = ws_res.scalar_one_or_none()
+    if not workspace:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+    mem_res = await db.execute(
+        select(WorkspaceMember.role).where(
+            WorkspaceMember.workspace_id == workspace.id,
+            WorkspaceMember.user_id == user_id
+        )
+    )
+    user_role = mem_res.scalar_one_or_none()
+    if not user_role:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You are not a member of this workspace"
+        )
+
+    return workspace, user_role
+
+
 async def _get_diagram_and_check_access(
     slug: str,
     user: User | None,
@@ -114,12 +142,13 @@ async def _get_diagram_and_check_access(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Diagram not found")
 
     project = diagram.project
+    workspace_id = project.workspace_id if project else diagram.workspace_id
     user_role = "viewer"
 
-    if user:
+    if user and workspace_id:
         mem_res = await db.execute(
             select(WorkspaceMember.role).where(
-                WorkspaceMember.workspace_id == project.workspace_id,
+                WorkspaceMember.workspace_id == workspace_id,
                 WorkspaceMember.user_id == user.id
             )
         )
@@ -148,6 +177,162 @@ async def _get_diagram_and_check_access(
             )
 
     return diagram, user_role
+
+
+# -----------------------------------------------------------------------------
+# 0. List All Diagrams in a Workspace (Both Standalone and Project-Nested)
+# -----------------------------------------------------------------------------
+@workspace_diagrams_router.get(
+    "",
+    response_model=list[DiagramSummaryResponse],
+    status_code=status.HTTP_200_OK,
+    summary="List all diagrams in a workspace",
+)
+@log_endpoint(folder_name="diagrams", file_name="diagrams.log")
+async def list_workspace_diagrams(
+    slug: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Fetch all diagrams belonging to the workspace.
+    Includes diagrams tied to project folders and standalone diagrams.
+    """
+    workspace, _ = await _get_workspace_and_verify_membership(slug, current_user.id, db)
+
+    stmt = (
+        select(Diagram)
+        .outerjoin(Project, Diagram.project_id == Project.id)
+        .where(
+            or_(
+                Diagram.workspace_id == workspace.id,
+                Project.workspace_id == workspace.id,
+            )
+        )
+        .order_by(Diagram.is_pinned.desc(), Diagram.created_at.desc())
+    )
+    diagrams = (await db.execute(stmt)).scalars().all()
+
+    # Query assigned members for private diagrams
+    diagram_ids = [d.id for d in diagrams]
+    members_map: dict[int, list[int]] = {did: [] for did in diagram_ids}
+    if diagram_ids:
+        mem_rows = (await db.execute(
+            select(DiagramMember.diagram_id, DiagramMember.user_id)
+            .where(DiagramMember.diagram_id.in_(diagram_ids))
+        )).all()
+        for did, uid in mem_rows:
+            members_map[did].append(uid)
+
+    return [
+        DiagramSummaryResponse(
+            id=d.id,
+            name=d.name,
+            type=d.type,
+            slug=d.slug,
+            project_id=d.project_id,
+            workspace_id=d.workspace_id or workspace.id,
+            creator_id=d.creator_id,
+            is_public=d.is_public,
+            is_pinned=d.is_pinned,
+            current_revision=d.current_revision,
+            created_at=d.created_at,
+            updated_at=d.updated_at,
+            member_user_ids=members_map.get(d.id, []),
+        )
+        for d in diagrams
+    ]
+
+
+# -----------------------------------------------------------------------------
+# 0b. Create a Diagram in a Workspace (Standalone or in Project)
+# -----------------------------------------------------------------------------
+@workspace_diagrams_router.post(
+    "",
+    response_model=DiagramDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new diagram in a workspace",
+)
+@log_endpoint(folder_name="diagrams", file_name="diagrams.log")
+async def create_workspace_diagram(
+    slug: str,
+    payload: DiagramCreate,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Create a new diagram canvas directly in the workspace or within a project.
+    Initializes Revision 1 with clean schema and layout snapshots.
+    """
+    workspace, user_role = await _get_workspace_and_verify_membership(slug, current_user.id, db)
+
+    if not PermissionChecker.is_permitted(user_role, Capability.EDIT_DIAGRAM):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: Viewers cannot create diagrams"
+        )
+
+    # If project_id is provided, verify project belongs to this workspace
+    project_id = payload.project_id
+    if project_id is not None:
+        p_res = await db.execute(
+            select(Project).where(Project.id == project_id, Project.workspace_id == workspace.id)
+        )
+        if not p_res.scalar_one_or_none():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found in this workspace")
+
+    new_slug = _generate_diagram_slug()
+
+    diagram = Diagram(
+        workspace_id=workspace.id,
+        project_id=project_id,
+        name=payload.name,
+        type=payload.type,
+        slug=new_slug,
+        creator_id=current_user.id,
+        is_public=payload.is_public,
+        is_pinned=payload.is_pinned,
+        current_revision=1,
+    )
+    db.add(diagram)
+    await db.flush()
+
+    initial_schema = {"tables": {}, "foreign_keys": []}
+    initial_layout = {"nodes": {}}
+
+    rev1 = DiagramRevision(
+        diagram_id=diagram.id,
+        revision_no=1,
+        command_type="init_diagram",
+        command_data={},
+        schema_snapshot=initial_schema,
+        layout_snapshot=initial_layout,
+        actor_id=current_user.id,
+    )
+    db.add(rev1)
+    await db.commit()
+    await db.refresh(diagram)
+
+    return DiagramDetailResponse(
+        id=diagram.id,
+        project_id=diagram.project_id,
+        workspace_id=diagram.workspace_id,
+        name=diagram.name,
+        type=diagram.type,
+        slug=diagram.slug,
+        creator_id=diagram.creator_id,
+        is_public=diagram.is_public,
+        is_pinned=diagram.is_pinned,
+        current_revision=diagram.current_revision,
+        created_at=diagram.created_at,
+        updated_at=diagram.updated_at,
+        member_user_ids=[],
+        schema_snapshot=initial_schema,
+        layout_snapshot=initial_layout,
+        user_role=user_role,
+    )
 
 
 # -----------------------------------------------------------------------------

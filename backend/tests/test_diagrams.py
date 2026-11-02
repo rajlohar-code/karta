@@ -213,3 +213,58 @@ async def test_public_diagram_and_revision_history(client: AsyncClient):
     assert revisions[0]["command_type"] == "add_table"
     assert revisions[1]["revision_no"] == 1
     assert revisions[1]["command_type"] == "init_diagram"
+
+
+@pytest.mark.asyncio
+async def test_workspace_diagrams_listing_and_standalone_creation(client: AsyncClient):
+    """
+    Test workspace-level diagram endpoints:
+    1. Create a workspace.
+    2. Create a standalone diagram (no project) via POST /api/v1/workspaces/{slug}/diagrams.
+    3. Create a project and a project-nested diagram.
+    4. Fetch all workspace diagrams via GET /api/v1/workspaces/{slug}/diagrams.
+    5. Verify both diagrams are returned with appropriate project_id and workspace_id.
+    """
+    # 1. Login
+    await client.post(
+        "/api/v1/auth/dev-session",
+        json={"email": "ws.diagrams@karta.app", "name": "Workspace Diagrams Tester", "role": "user"}
+    )
+    ws = (await client.post("/api/v1/workspaces", json={"name": "Workspace Canvas Hub"})).json()
+    slug = ws["slug"]
+
+    # 2. Create standalone diagram directly in workspace
+    standalone_res = await client.post(
+        f"/api/v1/workspaces/{slug}/diagrams",
+        json={"name": "Root Flowchart", "type": "flowchart", "is_public": False}
+    )
+    assert standalone_res.status_code == 201
+    standalone_diag = standalone_res.json()
+    assert standalone_diag["name"] == "Root Flowchart"
+    assert standalone_diag["project_id"] is None
+    assert standalone_diag["workspace_id"] == ws["id"]
+
+    # 3. Create a project and a nested diagram
+    proj = (await client.post(f"/api/v1/workspaces/{slug}/projects", json={"name": "Core Banking"})).json()
+    nested_res = await client.post(
+        f"/api/v1/workspaces/{slug}/diagrams",
+        json={"name": "Ledger Schema", "type": "schema", "project_id": proj["id"]}
+    )
+    assert nested_res.status_code == 201
+    nested_diag = nested_res.json()
+    assert nested_diag["project_id"] == proj["id"]
+
+    # 4. List all diagrams in this workspace
+    list_res = await client.get(f"/api/v1/workspaces/{slug}/diagrams")
+    assert list_res.status_code == 200
+    all_diags = list_res.json()
+    assert len(all_diags) == 2
+    names = {d["name"] for d in all_diags}
+    assert "Root Flowchart" in names
+    assert "Ledger Schema" in names
+
+    # 5. Verify standalone diagram can be fetched via GET /api/v1/diagrams/{slug}
+    root_slug = standalone_diag["slug"]
+    fetch_root = await client.get(f"/api/v1/diagrams/{root_slug}")
+    assert fetch_root.status_code == 200
+    assert fetch_root.json()["name"] == "Root Flowchart"

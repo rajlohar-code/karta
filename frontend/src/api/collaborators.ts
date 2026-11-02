@@ -192,3 +192,56 @@ export async function removeCollaborator(
   return response.json();
 }
 
+/**
+ * ---------------------------------------------------------------------------
+ * 4. Send an email invitation with unguessable token link and fine-grained permissions
+ * ---------------------------------------------------------------------------
+ *
+ * Endpoint: POST /api/v1/workspaces/{slug}/invitations
+ *
+ * Request Payload:
+ * {
+ *   "email": "teammate@example.com",
+ *   "role": "editor",
+ *   "permissions": { ... }
+ * }
+ *
+ * Response (201 Created):
+ * {
+ *   "id": 1,
+ *   "email": "teammate@example.com",
+ *   "token": "inv_9xK2mP1q...",
+ *   "invitation_link": "http://localhost:5173/join?token=...",
+ *   ...
+ * }
+ */
+export async function sendWorkspaceInvitation(
+  workspaceSlug: string,
+  email: string,
+  permissions: WorkspacePermissions
+): Promise<{ invitation_link: string; email: string; token: string }> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/workspaces/${encodeURIComponent(workspaceSlug)}/invitations`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      credentials: 'include',
+      body: JSON.stringify({
+        email,
+        role: 'editor',
+        permissions,
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({ detail: 'Failed to send invitation' }));
+    throw new Error(errorBody.detail || `HTTP Error ${response.status}`);
+  }
+
+  return response.json();
+}
+
