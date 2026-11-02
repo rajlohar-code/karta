@@ -521,6 +521,22 @@ async def update_diagram(
         diagram.is_public = payload.is_public
     if payload.is_pinned is not None:
         diagram.is_pinned = payload.is_pinned
+    if "project_id" in payload.model_fields_set:
+        if payload.project_id is not None:
+            target_proj_res = await db.execute(select(Project).where(Project.id == payload.project_id))
+            target_proj = target_proj_res.scalar_one_or_none()
+            if not target_proj:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Target project not found")
+            ws_id = diagram.workspace_id or (diagram.project.workspace_id if diagram.project else None)
+            if ws_id and target_proj.workspace_id != ws_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Cannot move diagram to a project in a different workspace"
+                )
+            diagram.project_id = target_proj.id
+            diagram.workspace_id = target_proj.workspace_id
+        else:
+            diagram.project_id = None
 
     await db.commit()
     await db.refresh(diagram)
@@ -547,6 +563,125 @@ async def delete_diagram(
     await db.delete(diagram)
     await db.commit()
     return {"status": "ok", "message": "Diagram deleted successfully"}
+
+
+# -----------------------------------------------------------------------------
+# 5b. Duplicate Diagram (Deep Clone Schema & Layout Snapshots)
+# -----------------------------------------------------------------------------
+@diagrams_router.post(
+    "/{slug}/duplicate",
+    response_model=DiagramDetailResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Duplicate an existing diagram canvas with its full schema and layout snapshots",
+)
+@log_endpoint(folder_name="diagrams", file_name="diagrams.log")
+async def duplicate_diagram(
+    slug: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Clones an existing diagram canvas, its schema tables, and layout nodes into a new diagram.
+    Generates a new unguessable slug and creates Revision 1 with the source snapshot.
+    """
+    source_diagram, user_role = await _get_diagram_and_check_access(slug, current_user, db, require_edit=False)
+
+    if not PermissionChecker.is_permitted(user_role, Capability.EDIT_DIAGRAM):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: Viewers cannot duplicate diagrams"
+        )
+
+    # 1. Calculate duplicate name with suffix (e.g. "E-Commerce 2")
+    base_name = source_diagram.name.strip()
+    import re
+    suffix_match = re.search(r"^(.*?)(?:\s+(\d+))?$", base_name)
+    clean_base = suffix_match.group(1).strip() if suffix_match and suffix_match.group(1) else base_name
+
+    # Find existing diagrams in same workspace or project
+    ws_id = source_diagram.workspace_id or (source_diagram.project.workspace_id if source_diagram.project else None)
+    if source_diagram.project_id is not None:
+        stmt = select(Diagram.name).where(Diagram.project_id == source_diagram.project_id)
+    else:
+        stmt = select(Diagram.name).where(Diagram.workspace_id == ws_id, Diagram.project_id.is_(None))
+    existing_names = (await db.execute(stmt)).scalars().all()
+
+    pattern = re.compile(rf"^{re.escape(clean_base)}(?:\s+(\d+))?$", re.IGNORECASE)
+    max_suffix = 1
+    for name in existing_names:
+        m = pattern.match(name.strip())
+        if m:
+            if m.group(1):
+                try:
+                    num = int(m.group(1))
+                    if num > max_suffix:
+                        max_suffix = num
+                except ValueError:
+                    pass
+
+    new_name = f"{clean_base} {max_suffix + 1}"
+    new_slug = _generate_diagram_slug()
+
+    # 2. Fetch latest snapshot of source diagram
+    rev_stmt = (
+        select(DiagramRevision)
+        .where(
+            DiagramRevision.diagram_id == source_diagram.id,
+            DiagramRevision.revision_no == source_diagram.current_revision
+        )
+    )
+    latest_rev = (await db.execute(rev_stmt)).scalar_one_or_none()
+    schema_snapshot = latest_rev.schema_snapshot if latest_rev else {"tables": {}, "foreign_keys": []}
+    layout_snapshot = latest_rev.layout_snapshot if latest_rev else {"nodes": {}}
+
+    # 3. Create cloned Diagram record
+    new_diagram = Diagram(
+        workspace_id=source_diagram.workspace_id or ws_id,
+        project_id=source_diagram.project_id,
+        name=new_name,
+        type=source_diagram.type,
+        slug=new_slug,
+        creator_id=current_user.id,
+        is_public=False,
+        is_pinned=False,
+        current_revision=1,
+    )
+    db.add(new_diagram)
+    await db.flush()
+
+    # 4. Initialize Revision 1 with cloned snapshots
+    rev1 = DiagramRevision(
+        diagram_id=new_diagram.id,
+        revision_no=1,
+        command_type="duplicate_diagram",
+        command_data={"source_slug": source_diagram.slug},
+        schema_snapshot=schema_snapshot,
+        layout_snapshot=layout_snapshot,
+        actor_id=current_user.id,
+    )
+    db.add(rev1)
+    await db.commit()
+    await db.refresh(new_diagram)
+
+    return DiagramDetailResponse(
+        id=new_diagram.id,
+        project_id=new_diagram.project_id,
+        workspace_id=new_diagram.workspace_id,
+        name=new_diagram.name,
+        type=new_diagram.type,
+        slug=new_diagram.slug,
+        creator_id=new_diagram.creator_id,
+        is_public=new_diagram.is_public,
+        is_pinned=new_diagram.is_pinned,
+        current_revision=new_diagram.current_revision,
+        created_at=new_diagram.created_at,
+        updated_at=new_diagram.updated_at,
+        member_user_ids=[],
+        schema_snapshot=schema_snapshot,
+        layout_snapshot=layout_snapshot,
+        user_role=user_role,
+    )
 
 
 # -----------------------------------------------------------------------------

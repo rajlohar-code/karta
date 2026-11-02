@@ -268,3 +268,28 @@ async def test_workspace_diagrams_listing_and_standalone_creation(client: AsyncC
     fetch_root = await client.get(f"/api/v1/diagrams/{root_slug}")
     assert fetch_root.status_code == 200
     assert fetch_root.json()["name"] == "Root Flowchart"
+
+    # 6. Move standalone diagram into project
+    move_to_proj = await client.patch(
+        f"/api/v1/diagrams/{root_slug}",
+        json={"project_id": proj["id"]}
+    )
+    assert move_to_proj.status_code == 200
+    assert move_to_proj.json()["project_id"] == proj["id"]
+
+    # 7. Move diagram back to workspace root (standalone)
+    move_to_root = await client.patch(
+        f"/api/v1/diagrams/{root_slug}",
+        json={"project_id": None}
+    )
+    assert move_to_root.status_code == 200
+    assert move_to_root.json()["project_id"] is None
+
+    # 8. Duplicate diagram via POST /api/v1/diagrams/{slug}/duplicate
+    dup_res = await client.post(f"/api/v1/diagrams/{root_slug}/duplicate")
+    assert dup_res.status_code == 201
+    dup_diag = dup_res.json()
+    assert dup_diag["name"] == "Root Flowchart 2"
+    assert dup_diag["slug"] != root_slug
+    assert dup_diag["current_revision"] == 1
+    assert dup_diag["type"] == "flowchart"

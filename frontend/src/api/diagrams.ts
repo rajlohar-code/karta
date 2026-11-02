@@ -67,25 +67,6 @@ export interface BackendDiagramDetailResponse extends BackendDiagramSummaryRespo
  * ---------------------------------------------------------------------------
  *
  * Endpoint: GET /api/v1/workspaces/{slug}/diagrams
- *
- * Request: None (Workspace slug in URL path, Session cookie in headers)
- *
- * Response (200 OK):
- * [
- *   {
- *     "id": 1,
- *     "name": "E-Commerce Database",
- *     "slug": "d_xK9mP2qR",
- *     "type": "schema",
- *     "project_id": 1,
- *     "is_public": false,
- *     "is_pinned": true,
- *     "current_revision": 1,
- *     "member_user_ids": [2],
- *     "created_at": "2026-10-30T10:00:00Z",
- *     "updated_at": "2026-10-30T10:00:00Z"
- *   }
- * ]
  */
 export async function listWorkspaceDiagrams(workspaceSlug: string): Promise<DiagramItem[]> {
   const response = await fetch(
@@ -124,23 +105,6 @@ export async function listWorkspaceDiagrams(workspaceSlug: string): Promise<Diag
  * ---------------------------------------------------------------------------
  *
  * Endpoint: POST /api/v1/workspaces/{slug}/diagrams
- *
- * Request Payload:
- * {
- *   "name": "unnamed_diagram_1",
- *   "type": "schema",
- *   "is_public": false,
- *   "is_pinned": false,
- *   "project_id": 1
- * }
- *
- * Response (201 Created):
- * {
- *   "id": 2,
- *   "name": "unnamed_diagram_1",
- *   "slug": "d_7vL3pQ9m",
- *   ...
- * }
  */
 export async function createWorkspaceDiagram(
   workspaceSlug: string,
@@ -193,17 +157,6 @@ export async function createWorkspaceDiagram(
  * ---------------------------------------------------------------------------
  *
  * Endpoint: GET /api/v1/diagrams/{slug}
- *
- * Response (200 OK):
- * {
- *   "id": 1,
- *   "name": "E-Commerce",
- *   "slug": "d_xK9mP2qR",
- *   "schema_snapshot": { "tables": { ... }, "foreign_keys": [ ... ] },
- *   "layout_snapshot": { "nodes": { ... } },
- *   "user_role": "owner",
- *   ...
- * }
  */
 export async function getDiagramCanvas(diagramSlug: string): Promise<BackendDiagramDetailResponse> {
   const response = await fetch(
@@ -231,11 +184,6 @@ export async function getDiagramCanvas(diagramSlug: string): Promise<BackendDiag
  * ---------------------------------------------------------------------------
  *
  * Endpoint: PATCH /api/v1/diagrams/{slug}
- *
- * Request Payload:
- * {
- *   "name": "Renamed Diagram"
- * }
  */
 export async function renameDiagramApi(
   diagramSlug: string,
@@ -279,11 +227,6 @@ export async function renameDiagramApi(
  * ---------------------------------------------------------------------------
  *
  * Endpoint: PATCH /api/v1/diagrams/{slug}
- *
- * Request Payload:
- * {
- *   "is_pinned": true
- * }
  */
 export async function togglePinDiagramApi(
   diagramSlug: string,
@@ -327,12 +270,6 @@ export async function togglePinDiagramApi(
  * ---------------------------------------------------------------------------
  *
  * Endpoint: DELETE /api/v1/diagrams/{slug}
- *
- * Response (200 OK):
- * {
- *   "status": "ok",
- *   "message": "Diagram deleted successfully"
- * }
  */
 export async function deleteDiagramApi(
   diagramSlug: string
@@ -356,3 +293,85 @@ export async function deleteDiagramApi(
   return response.json();
 }
 
+/**
+ * ---------------------------------------------------------------------------
+ * 7. Move a diagram into a project or to workspace root
+ * ---------------------------------------------------------------------------
+ *
+ * Endpoint: PATCH /api/v1/diagrams/{slug}
+ */
+export async function moveDiagramApi(
+  diagramSlug: string,
+  targetProjectId: number | null
+): Promise<DiagramItem> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/diagrams/${encodeURIComponent(diagramSlug)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      credentials: 'include',
+      body: JSON.stringify({ project_id: targetProjectId }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({ detail: 'Failed to move diagram' }));
+    throw new Error(errorBody.detail || `HTTP Error ${response.status}`);
+  }
+
+  const d: BackendDiagramSummaryResponse = await response.json();
+  return {
+    id: d.id,
+    name: d.name,
+    slug: d.slug,
+    type: d.type,
+    is_pinned: d.is_pinned,
+    is_public: d.is_public,
+    member_user_ids: d.member_user_ids || [],
+    project_id: d.project_id ?? null,
+    updated_at: 'Just now',
+  };
+}
+
+/**
+ * ---------------------------------------------------------------------------
+ * 8. Duplicate a diagram with its full schema & layout snapshots
+ * ---------------------------------------------------------------------------
+ *
+ * Endpoint: POST /api/v1/diagrams/{slug}/duplicate
+ */
+export async function duplicateDiagramApi(
+  diagramSlug: string
+): Promise<DiagramItem> {
+  const response = await fetch(
+    `${API_BASE_URL}/api/v1/diagrams/${encodeURIComponent(diagramSlug)}/duplicate`,
+    {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+      },
+      credentials: 'include',
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => ({ detail: 'Failed to duplicate diagram' }));
+    throw new Error(errorBody.detail || `HTTP Error ${response.status}`);
+  }
+
+  const d: BackendDiagramDetailResponse = await response.json();
+  return {
+    id: d.id,
+    name: d.name,
+    slug: d.slug,
+    type: d.type,
+    is_pinned: d.is_pinned,
+    is_public: d.is_public,
+    member_user_ids: d.member_user_ids || [],
+    project_id: d.project_id ?? null,
+    updated_at: 'Just now',
+  };
+}

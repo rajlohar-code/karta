@@ -94,6 +94,10 @@ class DiagramUpdate(BaseModel):
         default=None,
         description="Toggle pinned status"
     )
+    project_id: int | None = Field(
+        default=None,
+        description="Move diagram into a project folder, or null to move to workspace root"
+    )
 
 
 # -----------------------------------------------------------------------------

@@ -60,6 +60,8 @@ import {
   renameDiagramApi,
   togglePinDiagramApi,
   deleteDiagramApi,
+  moveDiagramApi,
+  duplicateDiagramApi,
 } from '../../../api/diagrams';
 import {
   getWorkspaceCollaborators,
@@ -1166,69 +1168,98 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
     }
   };
 
-  const handleDuplicateDiagram = (diagramId: number) => {
+  const handleDuplicateDiagram = async (diagramId: number) => {
     const source = diagrams.find((d) => d.id === diagramId);
     if (!source) return;
 
-    // Suffix calculation logic: "Diagram" -> "Diagram 2", "Diagram 3", etc.
-    const suffixMatch = source.name.trim().match(/^(.*?)(?:\s+(\d+))?$/);
-    const baseName = suffixMatch && suffixMatch[1] ? suffixMatch[1].trim() : source.name.trim();
+    if (source.slug && user) {
+      try {
+        const duplicatedDiag = await duplicateDiagramApi(source.slug);
+        setDiagrams((prev) => [duplicatedDiag, ...prev]);
 
-    // Check all existing diagrams sharing this base name
-    const escapedBase = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const pattern = new RegExp(`^${escapedBase}(?:\\s+(\\d+))?$`, 'i');
-    let maxSuffix = 1;
+        // Copy canvas content into local cache for instantaneous rendering
+        let clonedNodes: Node[] = [];
+        let clonedEdges: Edge[] = [];
+        if (source.slug === activeDiagramSlug) {
+          clonedNodes = JSON.parse(JSON.stringify(nodes));
+          clonedEdges = JSON.parse(JSON.stringify(edges));
+        } else {
+          try {
+            const storedNodes = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_nodes`);
+            if (storedNodes) clonedNodes = JSON.parse(storedNodes);
+            const storedEdges = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_edges`);
+            if (storedEdges) clonedEdges = JSON.parse(storedEdges);
+          } catch (err) {
+            console.error('Failed to clone source canvas state:', err);
+          }
+        }
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${duplicatedDiag.slug}_nodes`, JSON.stringify(clonedNodes));
+        localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${duplicatedDiag.slug}_edges`, JSON.stringify(clonedEdges));
 
-    diagrams.forEach((d) => {
-      const match = d.name.trim().match(pattern);
-      if (match) {
-        if (match[1]) {
-          const num = parseInt(match[1], 10);
-          if (num > maxSuffix) maxSuffix = num;
+        setActiveDiagramSlug(duplicatedDiag.slug);
+        setActiveMainTab('canvas');
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to duplicate diagram';
+        console.error('Failed to duplicate diagram on backend:', err);
+        alert(msg);
+      }
+    } else {
+      // Local fallback for guest users
+      const suffixMatch = source.name.trim().match(/^(.*?)(?:\s+(\d+))?$/);
+      const baseName = suffixMatch && suffixMatch[1] ? suffixMatch[1].trim() : source.name.trim();
+
+      const escapedBase = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(`^${escapedBase}(?:\\s+(\\d+))?$`, 'i');
+      let maxSuffix = 1;
+
+      diagrams.forEach((d) => {
+        const match = d.name.trim().match(pattern);
+        if (match) {
+          if (match[1]) {
+            const num = parseInt(match[1], 10);
+            if (num > maxSuffix) maxSuffix = num;
+          }
+        }
+      });
+
+      const newName = `${baseName} ${maxSuffix + 1}`;
+      const newSlug = `d_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+
+      let clonedNodes: Node[] = [];
+      let clonedEdges: Edge[] = [];
+      if (source.slug === activeDiagramSlug) {
+        clonedNodes = JSON.parse(JSON.stringify(nodes));
+        clonedEdges = JSON.parse(JSON.stringify(edges));
+      } else {
+        try {
+          const storedNodes = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_nodes`);
+          if (storedNodes) clonedNodes = JSON.parse(storedNodes);
+          const storedEdges = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_edges`);
+          if (storedEdges) clonedEdges = JSON.parse(storedEdges);
+        } catch (err) {
+          console.error('Failed to clone source canvas state:', err);
         }
       }
-    });
 
-    const newName = `${baseName} ${maxSuffix + 1}`;
-    const newSlug = `d_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify(clonedNodes));
+      localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify(clonedEdges));
 
-    // Clone canvas content: live if active, else from localStorage
-    let clonedNodes: Node[] = [];
-    let clonedEdges: Edge[] = [];
+      const newDiagram: DiagramItem = {
+        id: Date.now(),
+        name: newName,
+        slug: newSlug,
+        type: source.type,
+        is_pinned: false,
+        is_public: false,
+        member_user_ids: source.member_user_ids ? [...source.member_user_ids] : [1],
+        project_id: source.project_id ?? null,
+        updated_at: 'Just now',
+      };
 
-    if (source.slug === activeDiagramSlug) {
-      clonedNodes = JSON.parse(JSON.stringify(nodes));
-      clonedEdges = JSON.parse(JSON.stringify(edges));
-    } else {
-      try {
-        const storedNodes = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_nodes`);
-        if (storedNodes) clonedNodes = JSON.parse(storedNodes);
-        const storedEdges = localStorage.getItem(`${STORAGE_KEYS.CANVAS_PREFIX}${source.slug}_edges`);
-        if (storedEdges) clonedEdges = JSON.parse(storedEdges);
-      } catch (err) {
-        console.error('Failed to clone source canvas state:', err);
-      }
+      setDiagrams((prev) => [newDiagram, ...prev]);
+      setActiveDiagramSlug(newSlug);
+      setActiveMainTab('canvas');
     }
-
-    // Save cloned canvas state in localStorage
-    localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_nodes`, JSON.stringify(clonedNodes));
-    localStorage.setItem(`${STORAGE_KEYS.CANVAS_PREFIX}${newSlug}_edges`, JSON.stringify(clonedEdges));
-
-    const newDiagram: DiagramItem = {
-      id: Date.now(),
-      name: newName,
-      slug: newSlug,
-      type: source.type,
-      is_pinned: false,
-      is_public: false, // Default private
-      member_user_ids: source.member_user_ids ? [...source.member_user_ids] : [1],
-      project_id: source.project_id ?? null,
-      updated_at: 'Just now',
-    };
-
-    setDiagrams((prev) => [newDiagram, ...prev]);
-    setActiveDiagramSlug(newSlug);
-    setActiveMainTab('canvas');
   };
 
   const handleDeleteDiagram = async (diagramId: number) => {
@@ -1260,10 +1291,27 @@ export const SchemaCanvas: React.FC<SchemaCanvasProps> = ({
     }
   };
 
-  const handleMoveDiagram = (diagramId: number, targetProjectId: number | null) => {
+  const handleMoveDiagram = async (diagramId: number, targetProjectId: number | null) => {
+    const target = diagrams.find((d) => d.id === diagramId);
+    if (!target) return;
+
+    // 1. Optimistic update
+    const prevDiagrams = diagrams;
     setDiagrams((prev) =>
       prev.map((d) => (d.id === diagramId ? { ...d, project_id: targetProjectId } : d))
     );
+
+    // 2. Persist to Backend API
+    if (target.slug && user) {
+      try {
+        await moveDiagramApi(target.slug, targetProjectId);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : 'Failed to move diagram';
+        console.error('Failed to move diagram on backend:', err);
+        alert(msg);
+        setDiagrams(prevDiagrams); // Rollback
+      }
+    }
   };
 
   const handleTogglePinDiagram = async (diagramId: number) => {
